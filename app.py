@@ -13,9 +13,11 @@
 
 import re
 import json
+import os
 import streamlit as st
 from langchain_openai import ChatOpenAI
-from langchain.prompts import ChatPromptTemplate
+from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
+from langchain_core.messages import SystemMessage
 
 # ============================================================================
 # 全局配置区
@@ -71,8 +73,24 @@ def preprocess_script(raw_text: str) -> str:
 #   visual_constraints — 服装、环境等硬性画面要求（字符串列表）
 #   product_pitch      — 带货金句（字符串列表）
 
-# 这个 System Prompt 告诉大模型它扮演什么角色、输出什么格式
-SYSTEM_TEMPLATE = """\
+
+def load_system_prompt() -> str:
+    """
+    从外部文件 system_prompt.txt 加载系统提示词。
+    实现提示词的物理隔离，产品和运营可以直接编辑 txt 文件来调优 AI 行为，
+    无需修改 Python 代码，无需重启服务（下次调用时自动生效）。
+
+    如果文件不存在，退回内置的默认提示词作为兜底。
+    """
+    # system_prompt.txt 与 app.py 放在同一个目录下
+    prompt_file = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
+
+    if os.path.exists(prompt_file):
+        with open(prompt_file, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # ── 兜底提示词：当 system_prompt.txt 丢失时使用 ──
+    return """\
 你是一个顶级的短视频脚本精炼专家。你的任务是将用户输入的剧本拆解为三个维度，并以严格的 JSON 格式输出。
 
 【输出要求】
@@ -97,6 +115,7 @@ SYSTEM_TEMPLATE = """\
 }}
 """
 
+
 # 人类消息模板 —— 把用户选定的视觉基调和剧本内容一起送进模型
 HUMAN_TEMPLATE = """\
 【目标视觉基调】：{target_ip_style}
@@ -110,6 +129,8 @@ def build_chain(api_key: str = YOUR_API_KEY):
     """
     构建并返回一个 LangChain 处理链。
     链的结构：Prompt 模板 → 大模型（DeepSeek，JSON Mode 开启）
+
+    系统提示词从 system_prompt.txt 文件动态加载，支持热更新。
 
     参数：
       api_key — DeepSeek API Key，可从 Streamlit 界面动态传入，
@@ -126,10 +147,15 @@ def build_chain(api_key: str = YOUR_API_KEY):
         },
     )
 
-    # 用系统消息 + 人类消息构建 Prompt 模板
+    # 从 system_prompt.txt 动态加载系统提示词（物理隔离，支持热更新）
+    system_prompt = load_system_prompt()
+
+    # 用 SystemMessage 传入系统提示词——不经过模板格式化，
+    # 避免 txt 里 JSON 示例的 { } 被 LangChain 误当成变量占位符。
+    # 人类消息用 HumanMessagePromptTemplate，保留 {target_ip_style} 和 {script} 变量替换。
     prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_TEMPLATE),
-        ("human", HUMAN_TEMPLATE),
+        SystemMessage(content=system_prompt),
+        HumanMessagePromptTemplate.from_template(HUMAN_TEMPLATE),
     ])
 
     # 用 LCEL（LangChain Expression Language）把 prompt 和 llm 串成链
@@ -267,7 +293,7 @@ def main():
         user_api_key = st.text_input(
             label="🔑 DeepSeek API Key",
             type="password",
-            value=YOUR_API_KEY if YOUR_API_KEY != "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" else "",
+            value=YOUR_API_KEY if YOUR_API_KEY != "sk-d14103b94fd94a798f9d7dab627e1de0" else "",
             placeholder="在此粘贴你的 DeepSeek API Key",
             help="从 https://platform.deepseek.com/api_keys 获取。不会存储到服务器。",
         )
