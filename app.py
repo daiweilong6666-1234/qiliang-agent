@@ -264,12 +264,20 @@ def execute_phase3_routing(phase2_result: dict) -> dict:
     """执行 Phase 3：TTS 配音 + 视觉分发路由。"""
     storyboard = phase2_result.get("storyboard", {})
     storyboard_prompts = storyboard.get("storyboard_prompts", [])
-    phase1 = st.session_state.get("phase1_result", {})
-    hook_sentences = phase1.get("hook_sentences", [])
-    product_pitch = phase1.get("product_pitch", [])
+    translation = phase2_result.get("translation", {})
 
-    # TTS 文本片段：hook 句 + 带货金句
-    tts_segments = hook_sentences + product_pitch
+    # TTS 文本片段：必须使用 Phase 2 翻译通道输出的高置信度英文文本，
+    # 而非 Phase 1 的中文原句。按英文句子边界拆分 translated_script，
+    # 再追加 translated_pitches。
+    translated_script = translation.get("translated_script", "")
+    translated_pitches = translation.get("translated_pitches", [])
+
+    tts_segments = []
+    if translated_script:
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', translated_script) if s.strip()]
+        tts_segments.extend(sentences)
+    if translated_pitches:
+        tts_segments.extend(translated_pitches)
     tts_results = []
     if tts_segments:
         tts_audio_list = batch_tts(tts_segments)
@@ -553,39 +561,47 @@ def main():
                         }
 
             st.divider()
-            col_a, col_b, col_c = st.columns([1, 1, 6])
-            with col_a:
-                if st.button("✅ 确认品控结果", type="primary", use_container_width=True):
-                    reviewed = []
-                    for idx, candidate in enumerate(visual_candidates):
-                        dec = decisions.get(idx, {"approved": True, "reject_reason": ""})
-                        candidate_copy = dict(candidate)
-                        candidate_copy["review_status"] = (
-                            "approved" if dec["approved"] else "rejected"
+
+            # 醒目的阻断式审批闸门
+            st.warning(
+                "⚠️ **流水线已暂停！** 请人类指挥官逐条审核上述视觉候选素材，"
+                "勾选通过的条目后，点击下方按钮放行。"
+            )
+            if st.button(
+                "🛑 确认采纳视觉方案，进入第四阶段",
+                type="primary",
+                use_container_width=True,
+            ):
+                reviewed = []
+                for idx, candidate in enumerate(visual_candidates):
+                    dec = decisions.get(idx, {"approved": True, "reject_reason": ""})
+                    candidate_copy = dict(candidate)
+                    candidate_copy["review_status"] = (
+                        "approved" if dec["approved"] else "rejected"
+                    )
+                    candidate_copy["reject_reason"] = dec.get("reject_reason", "")
+                    reviewed.append(candidate_copy)
+
+                st.session_state["reviewed_visuals"] = reviewed
+                approved_count = sum(
+                    1 for r in reviewed if r["review_status"] == "approved"
+                )
+                st.success(
+                    f"品控完成！{approved_count}/{len(reviewed)} 个素材通过审核。"
+                )
+
+                # 继续执行 Phase 4
+                with st.spinner("🔄 Phase 4 装配车间运行中..."):
+                    try:
+                        phase4_result = execute_phase4_assembly(
+                            phase3_result,
+                            st.session_state.get("cleaned_script", ""),
                         )
-                        candidate_copy["reject_reason"] = dec.get("reject_reason", "")
-                        reviewed.append(candidate_copy)
-
-                    st.session_state["reviewed_visuals"] = reviewed
-                    approved_count = sum(
-                        1 for r in reviewed if r["review_status"] == "approved"
-                    )
-                    st.success(
-                        f"品控完成！{approved_count}/{len(reviewed)} 个素材通过审核。"
-                    )
-
-                    # 继续执行 Phase 4
-                    with st.spinner("🔄 Phase 4 装配车间运行中..."):
-                        try:
-                            phase4_result = execute_phase4_assembly(
-                                phase3_result,
-                                st.session_state.get("cleaned_script", ""),
-                            )
-                            st.session_state["phase4_result"] = phase4_result
-                            st.session_state["pipeline_stage"] = "awaiting_approval"
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"❌ Phase 4 执行失败: {e}")
+                        st.session_state["phase4_result"] = phase4_result
+                        st.session_state["pipeline_stage"] = "awaiting_approval"
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"❌ Phase 4 执行失败: {e}")
 
     # ── 特效审批阶段（Phase 4 之后）──
     elif stage == "awaiting_approval":
@@ -664,9 +680,20 @@ def main():
                 key="approval_feedback",
             )
 
+        st.divider()
+
+        # 醒目的阻断式审批闸门
+        st.warning(
+            "⚠️ **流水线已暂停！** 请人类指挥官审核上述特效方案，"
+            "做出最终决策后点击下方按钮完成装配。"
+        )
         col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 6])
         with col_btn1:
-            if st.button("📋 确认提交", type="primary", use_container_width=True):
+            if st.button(
+                "🛑 确认特效方案，完成装配",
+                type="primary",
+                use_container_width=True,
+            ):
                 decision_map = {
                     "确认": "approved",
                     "修改": "pending_revision",
