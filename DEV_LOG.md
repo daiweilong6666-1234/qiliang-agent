@@ -5,6 +5,88 @@
 
 ---
 
+## 2026-05-21：完成前后端全线总装 — 四阶段流水线集成
+
+### 做了什么
+
+将 `phase2_processor.py`、`phase3_multimodal.py` 和 `phase4_assembly.py` 三大独立模块的核心能力全部整合进 `app.py` 主程序，实现了从「输入剧本」到「最终装配方案」的完整一键式流水线。
+
+### 集成架构
+
+```
+用户输入剧本
+    │
+    ▼
+Phase 1: 脚本精炼 (原有的 app.py 逻辑)
+    │  输出 hook_sentences / visual_constraints / product_pitch
+    ▼
+Phase 2: 翻译 + 分镜并发 (接入 phase2_processor.process_phase2_sync)
+    │  输出 translated_pitches / storyboard_prompts
+    ▼
+Phase 3: TTS 配音 + 视觉分发路由 (接入 phase3_multimodal.batch_tts + visual_distribution_router)
+    │  输出 TTS 音频文件 + 视频/图像素材（黄金 30 秒路由）
+    │
+    ├── [人机协作节点 1] 视觉素材审核 ← Streamlit checkbox 替代 terminal input()
+    │
+    ▼
+Phase 4: 时间轴对齐 + 智能特效方案 (接入 phase4_assembly.build_timeline + generate_effects_plan)
+    │  输出 Timeline JSON + 特效方案
+    │
+    ├── [人机协作节点 2] 特效方案审批 ← Streamlit radio 替代 terminal input()
+    │
+    ▼
+最终输出：5 个 Tab 页展示全链路结果
+```
+
+### 关键技术决策
+
+**1. Session State 驱动的流水线状态机**
+
+Streamlit 的本质是「每次用户操作都重新执行整个脚本」。为了让四阶段不重复执行、人机协作节点能暂停等待，用 `st.session_state` 实现了 5 个状态的流水线：
+
+| 状态 | 含义 | 触发下一步 |
+|------|------|-----------|
+| `idle` | 等待用户输入剧本 | 点击「启动全线流水线」 |
+| `awaiting_review` | Phase 3 完成，等待品控 | 点击「确认品控结果」 |
+| `awaiting_approval` | Phase 4 完成，等待审批 | 点击「确认提交」 |
+| `complete` | 全线完成 | 点击「重置流水线」 |
+
+**2. 人机协作的 Streamlit 化**
+
+原来的 `human_review_interceptor()` 和 `human_final_approval()` 使用 Python 的 `input()` 函数阻塞终端等待输入——这在网页里根本用不了。改为纯 Streamlit 组件：
+
+- **视觉审核**：`st.checkbox`（逐条确认采纳/驳回 + 驳回原因文本框）
+- **特效审批**：`st.radio`（确认/修改/驳回三选一 + 修改意见文本框）
+
+不直接调原函数，而是在 Streamlit 层重建了等效的交互逻辑。
+
+**3. Tab 页展示全链路结果**
+
+用 `st.tabs` 把四个阶段的输出 + 全链路 JSON 分别放在独立 Tab 里，方便老板做 Demo 时逐个展示。
+
+**4. 数据格式桥接**
+
+四个阶段之间的数据格式不完全一致，做了三处桥接：
+- Phase 1 → Phase 2：给 `phase1_json` 补充 `script` 和 `target_ip_style` 字段
+- Phase 2 → Phase 3：把 `storyboard_prompts`（字符串列表）转换为 `[{prompt, duration_seconds}]` 格式
+- Phase 3 → Phase 4：TTS segments 补充 `text` 字段，视觉素材过滤掉品控驳回的条目
+
+**5. `st.status` 进度反馈**
+
+Phase 1~3 的自动执行阶段用 `st.status` 上下文管理器包裹，用户能看到每个阶段是成功还是失败，不再是黑盒等待。
+
+### 为什么要总装而不是保持独立
+
+- Phase 2/3/4 独立运行时，每个阶段都要手动准备输入数据、手动复制粘贴输出结果到下一阶段。四阶段串下来至少要 15 次手动操作。
+- 总装后一键启动，中间只需要两次人机决策（视觉审核 + 特效审批），其余全自动。
+- 老板看 Demo 时不可能等你手动跑四个脚本——一键出结果才是产品体验。
+
+### 如果不做会怎样
+
+四个模块代码都在但彼此孤立，Demo 时需要工程师手动衔接每一步。产品演示变成技术调试现场，老板看到的不是「AI 自动化生产工具」而是「命令行脚本集合」。商业 Demo 直接失败。
+
+---
+
 ## 2026-05-20：修复 LangChain 1.x 导入报错
 
 ### 问题

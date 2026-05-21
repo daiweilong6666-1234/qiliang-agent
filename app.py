@@ -1,7 +1,8 @@
 """
 ================================================================================
- 启量 Agent — 短视频自动化生产工具 MVP（第一阶段：脚本精炼引擎）
+ 启量 Agent — 短视频自动化生产工具 MVP（全线总装版）
  技术栈：Streamlit（前端） + LangChain（编排） + DeepSeek API（大模型）
+ 四阶段流水线：脚本精炼 → 翻译+分镜并发 → 多模态路由品控 → 时间轴装配
 ================================================================================
 
  【API Key 填写指引】
@@ -18,6 +19,15 @@ import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
 from langchain_core.messages import SystemMessage
+
+# 引入 phase2 / phase3 / phase4 的核心入口函数
+from phase2_processor import process_phase2_sync
+from phase3_multimodal import (
+    batch_tts, visual_distribution_router,
+)
+from phase4_assembly import (
+    build_timeline, generate_effects_plan,
+)
 
 # ============================================================================
 # 全局配置区
@@ -48,30 +58,15 @@ def preprocess_script(raw_text: str) -> str:
       2. 将连续 3 个以上的空行压缩为最多 2 个空行，保留合理段落间距
       3. 去除首尾多余的空白
     """
-    # 步骤 1：删除所有不可见的控制字符（\x00-\x1F 和 \x7F-\x9F），
-    #         但保留换行符 \n（\x0A）和回车符 \r（\x0D），因为它们是合法的段落分隔符。
-    #         这个正则匹配除了 \n \r 之外的所有控制字符。
     cleaned = re.sub(r"[\x00-\x09\x0B\x0C\x0E-\x1F\x7F-\x9F]", "", raw_text)
-
-    # 步骤 2：将 3 个及以上的连续空行压缩为恰好 2 个空行（即 3 个连续的 \n）。
-    #         (?:\n\s*){3,} 表示 3 组以上的"换行 + 可选空格"。
     cleaned = re.sub(r"(?:\n\s*){3,}", "\n\n", cleaned)
-
-    # 步骤 3：去除整个文本首尾多余的空白字符
     cleaned = cleaned.strip()
-
     return cleaned
 
 
 # ============================================================================
 # 模块二 & 三：LangChain 调度与强约束 JSON 输出
 # ============================================================================
-
-# 定义大模型输出的 JSON 结构 —— 用 Prompt 强约束，同时配合 DeepSeek 的 JSON Mode
-# 三个字段的含义：
-#   hook_sentences     — 吸引眼球的故事引子和冲突句（字符串列表）
-#   visual_constraints — 服装、环境等硬性画面要求（字符串列表）
-#   product_pitch      — 带货金句（字符串列表）
 
 
 def load_system_prompt() -> str:
@@ -82,7 +77,6 @@ def load_system_prompt() -> str:
 
     如果文件不存在，退回内置的默认提示词作为兜底。
     """
-    # system_prompt.txt 与 app.py 放在同一个目录下
     prompt_file = os.path.join(os.path.dirname(__file__), "system_prompt.txt")
 
     if os.path.exists(prompt_file):
@@ -131,36 +125,25 @@ def build_chain(api_key: str = YOUR_API_KEY):
     链的结构：Prompt 模板 → 大模型（DeepSeek，JSON Mode 开启）
 
     系统提示词从 system_prompt.txt 文件动态加载，支持热更新。
-
-    参数：
-      api_key — DeepSeek API Key，可从 Streamlit 界面动态传入，
-                未传入时使用代码顶部的默认值。
     """
-    # 初始化 DeepSeek 大模型（通过 OpenAI 兼容协议）
     llm = ChatOpenAI(
-        api_key=api_key,                         # API Key（支持动态传入）
-        base_url=DEEPSEEK_BASE_URL,              # DeepSeek 端点
-        model=MODEL_NAME,                        # 模型
-        temperature=TEMPERATURE,                 # 低温度 → 稳定输出
+        api_key=api_key,
+        base_url=DEEPSEEK_BASE_URL,
+        model=MODEL_NAME,
+        temperature=TEMPERATURE,
         model_kwargs={
-            "response_format": {"type": "json_object"}  # 强制 JSON Mode
+            "response_format": {"type": "json_object"}
         },
     )
 
-    # 从 system_prompt.txt 动态加载系统提示词（物理隔离，支持热更新）
     system_prompt = load_system_prompt()
 
-    # 用 SystemMessage 传入系统提示词——不经过模板格式化，
-    # 避免 txt 里 JSON 示例的 { } 被 LangChain 误当成变量占位符。
-    # 人类消息用 HumanMessagePromptTemplate，保留 {target_ip_style} 和 {script} 变量替换。
     prompt = ChatPromptTemplate.from_messages([
         SystemMessage(content=system_prompt),
         HumanMessagePromptTemplate.from_template(HUMAN_TEMPLATE),
     ])
 
-    # 用 LCEL（LangChain Expression Language）把 prompt 和 llm 串成链
     chain = prompt | llm
-
     return chain
 
 
@@ -169,26 +152,21 @@ def invoke_chain(chain, script: str, target_ip_style: str) -> dict:
     调用 LangChain 链，输入预处理后的剧本和目标视觉基调，返回解析后的字典。
     如果模型返回的不是合法 JSON，做一次容错兜底。
     """
-    # 调用链，获取大模型返回的原始消息
     response = chain.invoke({
         "script": script,
         "target_ip_style": target_ip_style,
     })
 
-    # response.content 是模型生成的文本（应该是一段 JSON 字符串）
     raw_output = response.content.strip()
 
     try:
         result = json.loads(raw_output)
     except json.JSONDecodeError:
-        # 如果 JSON 解析失败，尝试用正则从原始输出中提取 JSON 对象
-        # 这是兜底策略：有些模型可能在 JSON 前后加了少量文字
         match = re.search(r"\{.*\}", raw_output, re.DOTALL)
         if match:
             try:
                 result = json.loads(match.group(0))
             except json.JSONDecodeError:
-                # 两次解析都失败，返回一个结构一致的空结果
                 result = {
                     "hook_sentences": [],
                     "visual_constraints": [],
@@ -201,7 +179,6 @@ def invoke_chain(chain, script: str, target_ip_style: str) -> dict:
                 "product_pitch": [],
             }
 
-    # 确保三个字段都存在，缺的补空数组
     for key in ["hook_sentences", "visual_constraints", "product_pitch"]:
         if key not in result:
             result[key] = []
@@ -218,28 +195,19 @@ def enforce_visual_constraints(result: dict, target_ip_style: str) -> dict:
     扫描 visual_constraints 字段。
     如果其中没有包含用户选定的 Target_IP_Style 关键词，
     则强行将其追加（Append）到视觉约束列表中。
-
-    这样确保最终的画面要求不会遗漏用户指定的整体视觉基调。
     """
     constraints = result.get("visual_constraints", [])
 
-    # 把 target_ip_style 中的关键字符提取出来做模糊匹配
-    # 例如用户选 "3D拟人化水果角色" → 检查 "水果" 是否出现在现有约束中
-    # 也同时做整体字符串包含检查
     style_included = False
 
     for constraint in constraints:
-        # 检查约束文本中是否已提到目标风格的关键片段
         if target_ip_style in constraint:
             style_included = True
             break
-        # 做一次反向检查：目标风格是否包含约束中的关键词
-        # 这是为了处理用户可能在约束中用简称的情况
         if constraint and len(constraint) >= 2 and constraint in target_ip_style:
             style_included = True
             break
 
-    # 如果所有约束都没有匹配到目标风格，强行追加
     if not style_included:
         constraints.append(f"整体视觉基调：{target_ip_style}")
         result["visual_constraints"] = constraints
@@ -248,184 +216,644 @@ def enforce_visual_constraints(result: dict, target_ip_style: str) -> dict:
 
 
 # ============================================================================
+# 流水线状态管理
+# ============================================================================
+
+def init_session_state():
+    """初始化所有 session_state 变量。"""
+    defaults = {
+        "pipeline_stage": "idle",
+        "phase1_result": None,
+        "phase2_result": None,
+        "phase3_result": None,
+        "phase4_result": None,
+        "cleaned_script": None,
+        "reviewed_visuals": None,
+        "approval_decision": None,
+        "pipeline_error": None,
+    }
+    for key, val in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = val
+
+
+# ============================================================================
+# 各阶段执行函数
+# ============================================================================
+
+def execute_phase1(cleaned_script: str, target_ip_style: str, api_key: str) -> dict:
+    """执行 Phase 1：脚本精炼。"""
+    chain = build_chain(api_key=api_key)
+    result = invoke_chain(chain, cleaned_script, target_ip_style)
+    result = enforce_visual_constraints(result, target_ip_style)
+    return result
+
+
+def execute_phase2(phase1_result: dict, cleaned_script: str,
+                   target_ip_style: str, api_key: str) -> dict:
+    """执行 Phase 2：翻译 + 分镜异步并发。"""
+    phase1_json = {
+        **phase1_result,
+        "script": cleaned_script,
+        "target_ip_style": target_ip_style,
+    }
+    return process_phase2_sync(phase1_json, api_key=api_key)
+
+
+def execute_phase3_routing(phase2_result: dict) -> dict:
+    """执行 Phase 3：TTS 配音 + 视觉分发路由。"""
+    storyboard = phase2_result.get("storyboard", {})
+    storyboard_prompts = storyboard.get("storyboard_prompts", [])
+    phase1 = st.session_state.get("phase1_result", {})
+    hook_sentences = phase1.get("hook_sentences", [])
+    product_pitch = phase1.get("product_pitch", [])
+
+    # TTS 文本片段：hook 句 + 带货金句
+    tts_segments = hook_sentences + product_pitch
+    tts_results = []
+    if tts_segments:
+        tts_audio_list = batch_tts(tts_segments)
+        for idx, (seg, audio) in enumerate(zip(tts_segments, tts_audio_list)):
+            tts_results.append({
+                "text": seg,
+                "audio_path": audio.get("audio_path", ""),
+                "duration_seconds": audio.get("duration_seconds", 2.0),
+                "voice_id": audio.get("voice_id", "default"),
+                "segment_index": idx + 1,
+            })
+
+    # 将 storyboard_prompts（字符串列表）转换为视觉路由所需格式
+    shots_for_routing = []
+    cumulative_time = 0
+    for i, prompt_text in enumerate(storyboard_prompts):
+        # 每个分镜预估 5~8 秒
+        shot_duration = min(8.0, max(4.0, len(prompt_text) * 0.03))
+        cumulative_time += shot_duration
+        shots_for_routing.append({
+            "prompt": prompt_text,
+            "duration_seconds": round(cumulative_time, 1),
+        })
+
+    visual_results = []
+    if shots_for_routing:
+        visual_results = visual_distribution_router(shots_for_routing)
+
+    return {
+        "tts": tts_results,
+        "visual": visual_results,
+        "tts_segments": tts_segments,
+    }
+
+
+def execute_phase4_assembly(phase3_result: dict, cleaned_script: str) -> dict:
+    """执行 Phase 4：时间轴对齐 + 智能特效方案。"""
+    tts_segments = phase3_result.get("tts", [])
+    visual_shots = st.session_state.get("reviewed_visuals", [])
+
+    if not visual_shots:
+        visual_shots = phase3_result.get("visual", [])
+
+    return build_timeline_and_effects(tts_segments, visual_shots, cleaned_script)
+
+
+def build_timeline_and_effects(tts_segments: list, visual_shots: list,
+                               script_text: str) -> dict:
+    """执行时间轴对齐和特效方案生成。"""
+    timeline = build_timeline(
+        tts_segments=tts_segments,
+        visual_shots=visual_shots,
+    )
+
+    effects_plan = generate_effects_plan(
+        script_text=script_text,
+        total_duration_ms=timeline["total_duration_ms"],
+        shot_count=len(timeline["tracks"]["video"]),
+    )
+
+    return {
+        "timeline": timeline,
+        "effects_plan": effects_plan,
+    }
+
+
+# ============================================================================
 # Streamlit 可视化界面
 # ============================================================================
 
 def main():
     """
-    Streamlit 应用入口 —— 搭建极简的可视化网页界面。
-    布局从上到下：
-      1. 标题与说明
-      2. 侧边栏：API Key 配置 + 视觉基调选择
-      3. 主区域：剧本输入文本框
-      4. 按钮：触发处理流水线
-      5. 结果展示区
+    Streamlit 应用入口 —— 四阶段流水线总装版。
+    流水线：脚本精炼 → 翻译+分镜并发 → 多模态路由品控 → 时间轴装配
+    人机协作节点：视觉素材审核（Phase 3 后）、特效方案审批（Phase 4 后）
     """
 
-    # ── 页面基础配置 ──
     st.set_page_config(
-        page_title="启量 Agent · 脚本精炼引擎",
+        page_title="启量 Agent · 全线总装",
         page_icon="🎬",
         layout="wide",
     )
 
-    st.title("🎬 启量 Agent — 脚本精炼引擎（MVP 第一阶段）")
-    st.markdown("输入你的短视频剧本，AI 自动拆解为 **引子句 · 画面要求 · 带货金句**。")
+    init_session_state()
 
-    # ── 侧边栏：可调参数 ──
+    st.title("🎬 启量 Agent — 短视频自动化生产工具")
+    st.markdown(
+        "四阶段流水线：**脚本精炼** → **翻译+分镜并发** → "
+        "**多模态路由品控** → **时间轴装配**"
+    )
+
+    # ── 侧边栏 ──
     with st.sidebar:
         st.header("⚙️ 参数配置")
 
-        # 动态参数选择 —— 视觉基调下拉菜单
         target_ip_style = st.selectbox(
             label="🎨 Target IP Style（视觉基调）",
             options=[
                 "3D拟人化水果角色",
                 "美国真实街头风",
             ],
-            index=0,  # 默认选中第一项
-            help="选择视频的整体视觉风格基调，将影响 AI 对画面要求的提取。",
+            index=0,
+            help="选择视频的整体视觉风格基调。",
         )
 
         st.divider()
 
-        # API Key 输入框 —— 允许用户在网页上直接填入，覆盖代码中的默认值
         user_api_key = st.text_input(
             label="🔑 DeepSeek API Key",
             type="password",
-            value=YOUR_API_KEY if YOUR_API_KEY != "sk-d14103b94fd94a798f9d7dab627e1de0" else "",
+            value=YOUR_API_KEY if YOUR_API_KEY != "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" else "",
             placeholder="在此粘贴你的 DeepSeek API Key",
-            help="从 https://platform.deepseek.com/api_keys 获取。不会存储到服务器。",
+            help="从 https://platform.deepseek.com/api_keys 获取。",
         )
 
         st.divider()
-        st.caption("📦 技术栈：Streamlit + LangChain + DeepSeek")
-        st.caption("🌡 Temperature = 0.1  |  JSON Mode = ON")
+
+        # 流水线状态指示器
+        stage = st.session_state.get("pipeline_stage", "idle")
+        stage_labels = {
+            "idle": "⏳ 等待启动",
+            "awaiting_review": "👁 等待品控审核",
+            "awaiting_approval": "✅ 等待特效审批",
+            "complete": "🏁 流水线完成",
+        }
+        st.markdown(f"**流水线状态**: {stage_labels.get(stage, stage)}")
+
+        if stage != "idle":
+            if st.button("🔄 重置流水线", use_container_width=True):
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.rerun()
 
     # ── 主区域：剧本输入 ──
     st.subheader("📝 短视频剧本")
     raw_script = st.text_area(
         label="请在此粘贴或输入你的短视频剧本",
-        height=240,
+        height=200,
         placeholder="例如：\n\n你有没有想过，为什么超市里的苹果永远那么亮？\n其实背后藏着一个不为人知的秘密...\n\n今天我们就来揭秘水果保鲜的黑科技！\n这款保鲜喷雾，喷一下就能让水果发光7天...",
         help="支持多行文本，AI 会自动清理多余空行和不可见字符。",
     )
 
-    # ── 运行按钮 ──
-    col1, col2, col3 = st.columns([1, 1, 6])
-    with col1:
-        run_button = st.button(
-            "🚀 开始精炼",
-            type="primary",
-            disabled=False,
-            use_container_width=True,
+    # ── 启动按钮 ──
+    stage = st.session_state.get("pipeline_stage", "idle")
+
+    if stage == "idle":
+        st.divider()
+        col1, col2, col3 = st.columns([1, 1, 6])
+        with col1:
+            launch_btn = st.button(
+                "🚀 启动全线流水线",
+                type="primary",
+                use_container_width=True,
+            )
+
+        if launch_btn:
+            if not raw_script or not raw_script.strip():
+                st.error("❌ 请先输入剧本内容再启动流水线。")
+                return
+
+            final_api_key = user_api_key.strip() if user_api_key.strip() else YOUR_API_KEY
+            if not final_api_key or final_api_key == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
+                st.error("❌ 请先在侧边栏填入有效的 DeepSeek API Key。")
+                return
+
+            st.session_state["target_ip_style"] = target_ip_style
+            st.session_state["api_key"] = final_api_key
+
+            # ── 依次执行 Phase 1 → Phase 2 → Phase 3 路由 ──
+            try:
+                with st.status("🔄 四阶段流水线运行中...", expanded=True) as status:
+                    # Phase 1
+                    st.write("📋 **Phase 1**: 脚本精炼引擎运行中...")
+                    cleaned_script = preprocess_script(raw_script)
+                    st.session_state["cleaned_script"] = cleaned_script
+                    phase1_result = execute_phase1(
+                        cleaned_script, target_ip_style, final_api_key
+                    )
+                    st.session_state["phase1_result"] = phase1_result
+                    st.write(
+                        f"   ✅ Phase 1 完成 — "
+                        f"提取 {len(phase1_result.get('hook_sentences', []))} 个引子句, "
+                        f"{len(phase1_result.get('visual_constraints', []))} 条画面约束, "
+                        f"{len(phase1_result.get('product_pitch', []))} 条带货金句"
+                    )
+
+                    # Phase 2
+                    st.write("🌐 **Phase 2**: 翻译 + 分镜并发引擎运行中...")
+                    phase2_result = execute_phase2(
+                        phase1_result, cleaned_script, target_ip_style, final_api_key
+                    )
+                    st.session_state["phase2_result"] = phase2_result
+                    trans_status = phase2_result.get("translation", {}).get("status", "?")
+                    story_status = phase2_result.get("storyboard", {}).get("status", "?")
+                    shot_count = phase2_result.get("storyboard", {}).get("shot_count", 0)
+                    st.write(
+                        f"   ✅ Phase 2 完成 — "
+                        f"翻译通道: {trans_status}, 分镜通道: {story_status} ({shot_count} 个分镜)"
+                    )
+
+                    # Phase 3 路由
+                    st.write("🎬 **Phase 3**: TTS 配音 + 视觉分发路由运行中...")
+                    phase3_result = execute_phase3_routing(phase2_result)
+                    st.session_state["phase3_result"] = phase3_result
+                    visual_count = len(phase3_result.get("visual", []))
+                    tts_count = len(phase3_result.get("tts", []))
+                    video_count = sum(
+                        1 for v in phase3_result.get("visual", [])
+                        if v.get("type") == "video"
+                    )
+                    image_count = sum(
+                        1 for v in phase3_result.get("visual", [])
+                        if v.get("type") == "image"
+                    )
+                    st.write(
+                        f"   ✅ Phase 3 完成 — "
+                        f"TTS: {tts_count} 段配音, "
+                        f"视觉路由: {visual_count} 个素材 "
+                        f"({video_count} 视频 + {image_count} 图像)"
+                    )
+
+                    status.update(
+                        label="✅ 前三阶段完成！请审核视觉素材。",
+                        state="complete",
+                    )
+
+                st.session_state["pipeline_stage"] = "awaiting_review"
+                st.rerun()
+
+            except Exception as e:
+                st.session_state["pipeline_error"] = str(e)
+                st.error(f"❌ 流水线执行失败: {e}")
+
+    # ── 品控审核阶段（Phase 3 之后）──
+    elif stage == "awaiting_review":
+        phase3_result = st.session_state.get("phase3_result", {})
+        visual_candidates = phase3_result.get("visual", [])
+
+        st.divider()
+        st.subheader("👁 人机品控 — 视觉素材审核")
+        st.markdown(
+            f"共 **{len(visual_candidates)}** 个候选素材，"
+            f"请逐条审核并勾选通过的素材。"
         )
-    with col2:
-        clear_button = st.button(
-            "🗑 清空结果",
-            use_container_width=True,
+
+        if visual_candidates:
+            review_cols = st.columns(2)
+            decisions = {}
+
+            for idx, candidate in enumerate(visual_candidates):
+                with review_cols[idx % 2]:
+                    with st.container(border=True):
+                        viz_type = candidate.get("type", "?").upper()
+                        emoji_type = "🎥" if viz_type == "VIDEO" else "🖼"
+                        st.markdown(f"**{emoji_type} [{idx + 1}] {viz_type}**")
+                        st.caption(
+                            f"时间戳: {candidate.get('duration_seconds', '?')}s"
+                        )
+                        st.caption(
+                            f"Prompt: {candidate.get('prompt', 'N/A')[:120]}..."
+                        )
+                        st.caption(
+                            f"路由原因: {candidate.get('route_reason', 'N/A')}"
+                        )
+                        approved = st.checkbox(
+                            "确认采纳",
+                            value=True,
+                            key=f"review_{idx}",
+                        )
+                        if not approved:
+                            reject_reason = st.text_input(
+                                "驳回原因",
+                                key=f"reject_reason_{idx}",
+                                placeholder="输入驳回原因...",
+                            )
+                        else:
+                            reject_reason = ""
+                        decisions[idx] = {
+                            "approved": approved,
+                            "reject_reason": reject_reason if not approved else "",
+                        }
+
+            st.divider()
+            col_a, col_b, col_c = st.columns([1, 1, 6])
+            with col_a:
+                if st.button("✅ 确认品控结果", type="primary", use_container_width=True):
+                    reviewed = []
+                    for idx, candidate in enumerate(visual_candidates):
+                        dec = decisions.get(idx, {"approved": True, "reject_reason": ""})
+                        candidate_copy = dict(candidate)
+                        candidate_copy["review_status"] = (
+                            "approved" if dec["approved"] else "rejected"
+                        )
+                        candidate_copy["reject_reason"] = dec.get("reject_reason", "")
+                        reviewed.append(candidate_copy)
+
+                    st.session_state["reviewed_visuals"] = reviewed
+                    approved_count = sum(
+                        1 for r in reviewed if r["review_status"] == "approved"
+                    )
+                    st.success(
+                        f"品控完成！{approved_count}/{len(reviewed)} 个素材通过审核。"
+                    )
+
+                    # 继续执行 Phase 4
+                    with st.spinner("🔄 Phase 4 装配车间运行中..."):
+                        try:
+                            phase4_result = execute_phase4_assembly(
+                                phase3_result,
+                                st.session_state.get("cleaned_script", ""),
+                            )
+                            st.session_state["phase4_result"] = phase4_result
+                            st.session_state["pipeline_stage"] = "awaiting_approval"
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"❌ Phase 4 执行失败: {e}")
+
+    # ── 特效审批阶段（Phase 4 之后）──
+    elif stage == "awaiting_approval":
+        phase4_result = st.session_state.get("phase4_result", {})
+        effects_plan = phase4_result.get("effects_plan", {})
+        timeline = phase4_result.get("timeline", {})
+
+        st.divider()
+        st.subheader("🎛 最终审批 — 智能特效方案")
+
+        # 特效方案展示
+        eff_col1, eff_col2, eff_col3 = st.columns(3)
+
+        with eff_col1:
+            st.markdown("#### 🎵 BGM 推荐")
+            bgm = effects_plan.get("recommended_bgm", {})
+            st.metric("检测情绪", effects_plan.get("detected_emotion", "默认"))
+            st.markdown(f"**曲目**: {bgm.get('name', 'N/A')}")
+            st.markdown(f"**BPM**: {bgm.get('bpm', '?')}")
+            st.markdown(f"**风格**: {bgm.get('style', '?')}")
+            st.markdown(f"**音量**: {effects_plan.get('bgm_volume', 0.3) * 100:.0f}%")
+
+        with eff_col2:
+            st.markdown("#### 🎬 转场 + 关键帧")
+            st.markdown(
+                f"**转场数量**: {effects_plan.get('transition_count', 0)} 处"
+            )
+            kf = effects_plan.get("keyframe_plan", {})
+            st.markdown(f"**关键帧策略**: {kf.get('strategy', '?')}")
+            st.markdown(
+                f"**缩放**: {kf.get('start_scale', 1.0)}x → "
+                f"{kf.get('peak_scale', 1.3)}x"
+            )
+            st.markdown(f"**缓动**: {kf.get('easing', '?')}")
+
+        with eff_col3:
+            st.markdown("#### 🎨 调色 + 叠加")
+            st.markdown(f"**调色预设**: {effects_plan.get('color_grading', '?')}")
+            overlays = effects_plan.get("overlay_effects", [])
+            if overlays:
+                for ov in overlays:
+                    st.markdown(f"- {ov}")
+            else:
+                st.caption("无叠加特效")
+
+        # 时间轴摘要
+        st.divider()
+        st.markdown("#### ⏱ 时间轴摘要")
+        tc1, tc2, tc3, tc4 = st.columns(4)
+        with tc1:
+            st.metric("总时长", f"{timeline.get('total_duration_seconds', 0)}s")
+        with tc2:
+            stats = timeline.get("alignment_stats", {})
+            st.metric("音频片段", stats.get("audio_clips", 0))
+        with tc3:
+            st.metric("视觉片段", stats.get("video_clips", 0))
+        with tc4:
+            st.metric("字幕条目", stats.get("subtitle_clips", 0))
+
+        # 审批决策
+        st.divider()
+        st.markdown("#### ✋ 请做出最终决策")
+
+        approval_decision = st.radio(
+            "特效方案审批",
+            options=["确认 — 一键应用此方案", "修改 — 输入修改意见", "驳回 — 放弃此方案"],
+            index=0,
+            key="approval_radio",
         )
 
-    if clear_button:
-        # 清空历史结果（通过操作 session_state）
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
+        feedback_text = ""
+        if "修改" in approval_decision:
+            feedback_text = st.text_area(
+                "修改意见",
+                placeholder="请输入需要调整的内容...",
+                key="approval_feedback",
+            )
 
-    # ── 结果显示区域 ──
-    st.divider()
-    st.subheader("📊 精炼结果")
+        col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 6])
+        with col_btn1:
+            if st.button("📋 确认提交", type="primary", use_container_width=True):
+                decision_map = {
+                    "确认": "approved",
+                    "修改": "pending_revision",
+                    "驳回": "rejected",
+                }
+                human_decision = "确认"
+                if "修改" in approval_decision:
+                    human_decision = "修改"
+                elif "驳回" in approval_decision:
+                    human_decision = "驳回"
 
-    # 用占位符来动态更新结果区域
-    result_placeholder = st.empty()
+                final_status = decision_map.get(human_decision, "rejected")
 
-    if run_button:
-        # ── 输入验证 ──
-        if not raw_script or not raw_script.strip():
-            st.error("❌ 请先输入剧本内容再点击精炼。")
-            return
+                # 构建审批结果
+                approval_result = {
+                    "human_decision": human_decision,
+                    "final_status": final_status,
+                    "effects_plan_applied": (
+                        effects_plan if final_status != "rejected" else None
+                    ),
+                    "human_feedback": feedback_text if feedback_text else "",
+                }
 
-        final_api_key = user_api_key.strip() if user_api_key.strip() else YOUR_API_KEY
-        if not final_api_key or final_api_key == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
-            st.error("❌ 请先在侧边栏填入有效的 DeepSeek API Key。")
-            return
+                phase4_result["approval"] = approval_result
+                st.session_state["phase4_result"] = phase4_result
+                st.session_state["approval_decision"] = approval_result
+                st.session_state["pipeline_stage"] = "complete"
+                st.rerun()
 
-        # ── 流水线执行步骤（用进度条给用户可见的反馈）──
-        with st.spinner("🔄 流水线运行中，请稍候..."):
-            progress_bar = st.progress(0, text="正在预处理剧本...")
+    # ── 流水线完成 ──
+    if st.session_state.get("pipeline_stage") == "complete":
+        st.divider()
+        st.success("## 🏁 全线流水线执行完毕！")
 
-            # 步骤 1：预处理
-            cleaned_script = preprocess_script(raw_script)
-            progress_bar.progress(20, text="预处理完成，正在调用 AI 模型...")
+        phase1 = st.session_state.get("phase1_result", {})
+        phase2 = st.session_state.get("phase2_result", {})
+        phase3 = st.session_state.get("phase3_result", {})
+        phase4 = st.session_state.get("phase4_result", {})
+        approval = st.session_state.get("approval_decision", {})
 
-            # 步骤 2：构建链（动态注入用户填写的 API Key）
-            chain = build_chain(api_key=final_api_key)
+        # Tab 式结果展示
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "📋 Phase 1 脚本精炼",
+            "🌐 Phase 2 翻译+分镜",
+            "🎬 Phase 3 多模态",
+            "⏱ Phase 4 装配",
+            "📊 全链路 JSON",
+        ])
 
-            progress_bar.progress(40, text="AI 模型推理中（约 3~5 秒）...")
-
-            # 步骤 3：调用链
-            result = invoke_chain(chain, cleaned_script, target_ip_style)
-            progress_bar.progress(70, text="正在执行规则校验...")
-
-            # 步骤 4：动态规则校验兜底
-            result = enforce_visual_constraints(result, target_ip_style)
-            progress_bar.progress(90, text="校验完成，正在渲染结果...")
-
-            progress_bar.progress(100, text="✅ 完成！")
-            st.toast("精炼完成！", icon="✅")
-
-        # ── 结果渲染 ──
-        with result_placeholder.container():
-            st.success("### ✅ 精炼成功！")
-
-            # 三列布局展示三个维度的结果
+        with tab1:
             col_a, col_b, col_c = st.columns(3)
-
             with col_a:
                 st.markdown("#### 🔥 引子 / 冲突句")
-                hooks = result.get("hook_sentences", [])
+                hooks = phase1.get("hook_sentences", [])
                 if hooks:
-                    for idx, sentence in enumerate(hooks, start=1):
-                        # 用高亮样式展示每一条
-                        st.markdown(f"> **{idx}.** {sentence}")
+                    for idx, s in enumerate(hooks, start=1):
+                        st.markdown(f"> **{idx}.** {s}")
                 else:
                     st.caption("（未提取到相关内容）")
 
             with col_b:
                 st.markdown("#### 🎬 画面约束")
-                visuals = result.get("visual_constraints", [])
+                visuals = phase1.get("visual_constraints", [])
+                target_style = st.session_state.get("target_ip_style", "")
                 if visuals:
-                    for idx, constraint in enumerate(visuals, start=1):
-                        # 如果约束是刚刚被代码追加的，加一个标记
-                        if ("整体视觉基调" in constraint
-                                and target_ip_style in constraint):
-                            st.markdown(f"> **{idx}.** {constraint} 🛡️")
+                    for idx, v in enumerate(visuals, start=1):
+                        if "整体视觉基调" in v and target_style in v:
+                            st.markdown(f"> **{idx}.** {v} 🛡️")
                         else:
-                            st.markdown(f"> **{idx}.** {constraint}")
+                            st.markdown(f"> **{idx}.** {v}")
                 else:
                     st.caption("（未提取到相关内容）")
 
             with col_c:
                 st.markdown("#### 💰 带货金句")
-                pitches = result.get("product_pitch", [])
+                pitches = phase1.get("product_pitch", [])
                 if pitches:
-                    for idx, pitch in enumerate(pitches, start=1):
-                        st.markdown(f"> **{idx}.** {pitch}")
+                    for idx, p in enumerate(pitches, start=1):
+                        st.markdown(f"> **{idx}.** {p}")
                 else:
                     st.caption("（未提取到相关内容）")
 
-            # 折叠区：原始 JSON（方便你调试 / 对接下游系统）
-            with st.expander("🔍 查看完整 JSON 输出", expanded=False):
-                st.json(result)
+        with tab2:
+            translation = phase2.get("translation", {})
+            storyboard = phase2.get("storyboard", {})
 
-            # 折叠区：对比预处理前后的文本
+            st.markdown("#### 🌐 翻译通道")
+            st.markdown(f"**状态**: {translation.get('status', 'N/A')}")
+            st.markdown(f"**目标语言**: {translation.get('target_language', 'N/A')}")
+            trans_pitches = translation.get("translated_pitches", [])
+            if trans_pitches:
+                for idx, tp in enumerate(trans_pitches, start=1):
+                    st.markdown(f"> **{idx}.** {tp}")
+            loc_notes = translation.get("localization_notes", [])
+            if loc_notes:
+                st.markdown("**本地化备注**:")
+                for note in loc_notes:
+                    st.markdown(f"- {note}")
+
+            st.markdown("#### 🎬 分镜通道")
+            st.markdown(f"**状态**: {storyboard.get('status', 'N/A')}")
+            st.markdown(f"**分镜数量**: {storyboard.get('shot_count', 0)}")
+            st.markdown(f"**全局风格备注**: {storyboard.get('global_style_note', '无')}")
+            prompts = storyboard.get("storyboard_prompts", [])
+            if prompts:
+                for idx, sp in enumerate(prompts, start=1):
+                    st.markdown(f"> **镜头 {idx}**: {sp}")
+
+        with tab3:
+            tts_data = phase3.get("tts", [])
+            visual_data = phase3.get("visual", [])
+            reviewed = st.session_state.get("reviewed_visuals", visual_data)
+
+            st.markdown("#### 🎙 TTS 配音")
+            if tts_data:
+                for idx, t in enumerate(tts_data, start=1):
+                    st.markdown(
+                        f"> **{idx}.** {t.get('text', '')} "
+                        f"({t.get('duration_seconds', 0)}s)"
+                    )
+            else:
+                st.caption("（无 TTS 数据）")
+
+            st.markdown("#### 🎥 视觉路由结果（品控后）")
+            if reviewed:
+                for idx, v in enumerate(reviewed, start=1):
+                    status_icon = "✅" if v.get("review_status") == "approved" else "❌"
+                    st.markdown(
+                        f"> **{idx}.** {status_icon} "
+                        f"[{v.get('type', '?').upper()}] "
+                        f"{v.get('prompt', 'N/A')[:100]}..."
+                    )
+                    if v.get("review_status") == "rejected":
+                        st.caption(f"   驳回原因: {v.get('reject_reason', '?')}")
+
+        with tab4:
+            timeline = phase4.get("timeline", {})
+            effects = phase4.get("effects_plan", {})
+            appr = approval or phase4.get("approval", {})
+
+            st.markdown("#### ⏱ 时间轴")
+            st.json({
+                "total_duration_s": timeline.get("total_duration_seconds"),
+                "alignment_stats": timeline.get("alignment_stats"),
+            })
+
+            st.markdown("#### 🎛 特效方案")
+            st.markdown(f"**情绪**: {effects.get('detected_emotion')}")
+            st.markdown(f"**BGM**: {effects.get('recommended_bgm', {}).get('name')}")
+            st.markdown(f"**调色**: {effects.get('color_grading')}")
+
+            st.markdown("#### ✋ 审批结果")
+            st.markdown(f"**决策**: {appr.get('human_decision', 'N/A')}")
+            st.markdown(f"**状态**: {appr.get('final_status', 'N/A')}")
+            if appr.get("human_feedback"):
+                st.markdown(f"**反馈**: {appr['human_feedback']}")
+
+        with tab5:
+            st.markdown("#### 📊 全链路结构化数据")
+            full_pipeline = {
+                "phase1_script_refinement": phase1,
+                "phase2_translation_storyboard": {
+                    "translation": phase2.get("translation"),
+                    "storyboard": phase2.get("storyboard"),
+                },
+                "phase3_multimodal": {
+                    "tts_count": len(phase3.get("tts", [])),
+                    "visual_count": len(phase3.get("visual", [])),
+                    "reviewed_visuals": st.session_state.get("reviewed_visuals", []),
+                },
+                "phase4_assembly": {
+                    "timeline_summary": phase4.get("timeline", {}).get("alignment_stats"),
+                    "effects_plan": phase4.get("effects_plan"),
+                    "approval": approval or phase4.get("approval"),
+                },
+            }
+            st.json(full_pipeline)
+
+            # 预处理对比
             with st.expander("📋 查看预处理前后对比", expanded=False):
-                comp_col_a, comp_col_b = st.columns(2)
-                with comp_col_a:
+                c1, c2 = st.columns(2)
+                with c1:
                     st.caption("原始输入")
                     st.text(raw_script)
-                with comp_col_b:
-                    st.caption("预处理后（传给 AI 的文本）")
-                    st.text(cleaned_script)
+                with c2:
+                    st.caption("预处理后")
+                    st.text(st.session_state.get("cleaned_script", ""))
 
 
 # ============================================================================
