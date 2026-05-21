@@ -1,0 +1,34 @@
+{
+  "detected_emotion": "默认",
+  "recommended_bgm": {
+    "name": "Chill_Vlog_01",
+    "bpm": 95,
+    "style": "lofi_hiphop"
+  },
+  "bgm_start_ms": 0,
+  "bgm_end_ms": 3500,
+  "bgm_volume": 0.3,
+  "transition_plan": [
+    {
+      "from_clip_index": 0,
+      "to_clip_index": 1,
+      "type": "crossfade",
+      "duration_ms": 300
+    }
+  ],
+  "transition_count": 1,
+  "keyframe_plan": {
+    "strategy": "hook_intro",
+    "start_scale": 1.5,
+    "peak_scale": 1.0,
+    "duration_ms": 800,
+    "apply_to_clips": [
+      0,
+      1
+    ],
+    "easing": "ease_in_out_cubic"
+  },
+  "color_grading": "natural_balanced",
+  "overlay_effects": [],
+  "global_effects_note": "[默认风格] BGM: Chill_Vlog_01 | 调色: natural_balanced | 关键帧策略: hook_intro"
+}

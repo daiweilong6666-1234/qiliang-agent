@@ -205,6 +205,16 @@ process_phase2(phase1_json, target_language="en")
 
 ---
 
+## 2026-05-21：第四阶段完工 — 半自动装配车间
+
+新建 `phase4_assembly.py`，实现三大模块：
+
+1. **时间轴对齐引擎** — `build_timeline()`，以 TTS 音频为锚点，毫秒级对齐音频/视觉/字幕三条轨道，输出结构化 Timeline JSON。
+2. **智能特效方案** — `generate_effects_plan()`，基于剧本关键词做情绪检测，自动推荐 BGM、转场方案、关键帧缩放策略、调色预设、叠加特效。
+3. **人机协作最终防线** — `human_final_approval()`，打印特效方案后 `input()` 阻塞等待人类输入"确认/修改/驳回"，只有确认通过才输出最终装配成功日志。
+
+---
+
 ## 2026-05-21：第三阶段完工 — 多模态视觉铸造与品控车间
 
 新建 `phase3_multimodal.py`，实现三大模块：
