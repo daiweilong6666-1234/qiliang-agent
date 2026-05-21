@@ -205,6 +205,16 @@ process_phase2(phase1_json, target_language="en")
 
 ---
 
+## 2026-05-21：第三阶段完工 — 多模态视觉铸造与品控车间
+
+新建 `phase3_multimodal.py`，实现三大模块：
+
+1. **TTS 配音通道** — `text_to_speech()` / `batch_tts()`，预留真实语音 API 接口，当前 Mock 模式生成占位音频文件。
+2. **黄金 30 秒视觉路由** — `visual_distribution_router()`，前 30s 强制路由到视频生成 API，30s 后强制路由到图像生成 API，以最小成本最大化留存率。
+3. **人机品控拦截器** — `human_review_interceptor()`，视觉素材输出后阻塞等待人工输入"确认采纳"，支持逐条审核和批量审核两种模式。
+
+---
+
 ## 2026-05-20：项目初始化 & MVP 第一阶段搭建
 
 ### 1. 选了 Streamlit 做界面，而不是 HTML/JS
