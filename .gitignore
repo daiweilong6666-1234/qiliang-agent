@@ -25,5 +25,6 @@ Thumbs.db
 .env
 .env.local
 
-# Phase 3 mock output (generated files)
+# Phase 3 / 4 mock output (generated files)
 phase3_output/
+phase4_output/
