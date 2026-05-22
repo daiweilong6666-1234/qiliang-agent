@@ -5,6 +5,54 @@
 
 ---
 
+## 2026-05-21：实弹换装 — 移除全部 Mock，挂载硅基流动 TTS + 海螺AI 视觉生成
+
+### 做了什么
+
+彻底剥离 Phase 3 全部占位假数据代码，换上真实的云端 AI API 调用：
+
+| 模块 | 原来（Mock） | 现在（实弹） |
+|------|-------------|-------------|
+| TTS 配音 | 写 `.txt` 占位文件 | 调用硅基流动 CosyVoice2 API，生成真实 `.mp3` |
+| 图像生成 | 写 `.txt` 占位文件 | 调用海螺AI MiniMax image-01 API，下载真实 `.png` |
+| 视频生成 | 写 `.txt` 占位文件 | 调用海螺AI MiniMax video-01 API（异步轮询），下载真实 `.mp4` |
+| 前端播片 | `st.video()` 播放测试替身视频 | `st.audio()` + `st.image()` 动态渲染真实生成内容 |
+| API 密钥 | 硬编码 | `.env` 文件物理隔离，手动解析无需 `python-dotenv` |
+
+### 架构改动
+
+**`.env` 文件（新建）**：
+```
+SILICONFLOW_API_KEY=sk_xxx  → 硅基流动 TTS
+MINIMAX_API_KEY=your_xxx    → 海螺AI 图像/视频（需用户自行填入）
+```
+
+**`phase3_multimodal.py` 重写**：
+- `_load_env()` — 手动解析 `.env`，零外部依赖
+- `text_to_speech()` — HTTP POST 调用硅基流动 `/v1/audio/speech`（OpenAI 兼容协议），输出真实 MP3 二进制 → 写入 `output_assets/audio/`
+- `image_generation_api()` — HTTP POST 调用 MiniMax `/v1/image_generation`，从返回 URL 下载真实图片 → 写入 `output_assets/visual/`
+- `video_generation_api()` — 提交 MiniMax 视频任务 → 轮询等待完成（最大 180s）→ 超时自动降级为图像生成
+- `_fallback_tts()` / `_fallback_visual()` — 统一降级策略：API 不可用时写占位 `.txt` 文件，不崩流程
+
+**`app.py` 前端重构**：
+- 移除 `ensure_test_video()`、`_MINIMAL_MP4_BYTES`、测试视频下载等全部替身代码
+- `video_review` 阶段改为两栏动态渲染：
+  - 上半区：`st.audio()` 播放真实 TTS 生成的 `.mp3`
+  - 下半区：`st.image()` 展示真实海螺AI 生成的 `.png`
+- 降级/失败素材收进折叠区，不影响主视觉
+- 保留「视觉审核通过，生成剪映底层草稿文件！」最终闸门按钮
+
+### 为什么 TTS 用硅基流动、生图用海螺AI
+
+- **硅基流动**：聚合平台，CosyVoice2 在中文市场的语音自然度是 T0 级别，API 兼容 OpenAI 协议（零学习成本），价格便宜
+- **海螺AI MiniMax**：video-01 是目前国产唯一能稳定输出 5 秒短视频片段的 API，image-01 画质接近 Midjourney v6，适合 Demo 展示
+
+### 如果不做会怎样
+
+占位假数据只能证明"技术能跑通"，但投资人/老板不会为 `.txt` 文件买单。实弹换装后，Demo 展示的是真实 AI 配音 + AI 生成的画面——这才是产品价值。
+
+---
+
 ## 2026-05-21：私有化播片重构 — 终极闭环 Demo 视频播放器 + 剪映草稿导出
 
 ### 做了什么

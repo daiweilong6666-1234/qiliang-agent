@@ -15,7 +15,6 @@
 import re
 import json
 import os
-import requests
 import streamlit as st
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
@@ -345,91 +344,8 @@ def build_timeline_and_effects(tts_segments: list, visual_shots: list,
     }
 
 
-# ============================================================================
-# 测试替身视频引擎（私有化部署 Demo）
-# ============================================================================
-
-# 测试视频本地存储路径
+# 剪映草稿输出目录
 OUTPUT_ASSETS_DIR = os.path.join(os.path.dirname(__file__), "output_assets")
-TEST_VIDEO_PATH = os.path.join(OUTPUT_ASSETS_DIR, "test_video.mp4")
-
-# 最小可行 MP4 文件（1 帧纯黑 160x120 H.264 编码）的结构化字节模板。
-# 此模板用于在无网络、无 ffmpeg 的隔离环境中自举生成一个合法 MP4 文件，
-# 确保 Streamlit st.video() 在 Demo 演示时有真实视频可播。
-_MINIMAL_MP4_BYTES = (
-    b"\x00\x00\x00\x1c\x66\x74\x79\x70\x6d\x70\x34\x32\x00\x00\x00\x00"
-    b"\x6d\x70\x34\x31\x6d\x70\x34\x32\x69\x73\x6f\x6d\x00\x00\x00\x08"
-    b"\x6d\x6f\x6f\x76\x00\x00\x00\x6c\x6d\x76\x68\x64\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\xe8\x00\x00\x00\x00"
-    b"\x00\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x02\x00\x00\x00\xc8\x74\x72\x61\x6b\x00\x00\x00\x5c"
-    b"\x74\x6b\x68\x64\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x40\x00\x00\x00\xa0\x00\x00\x00\xa0\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x64\x6d\x64\x69\x61"
-    b"\x00\x00\x00\x20\x6d\x64\x68\x64\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x2c\x68\x64\x6c\x72"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x76\x69\x64\x65\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x56\x69\x64\x65\x6f\x48\x61\x6e"
-    b"\x64\x6c\x65\x72\x00\x00\x00\x00\x00\x00\x00\x24\x6d\x69\x6e\x66"
-    b"\x00\x00\x00\x14\x76\x6d\x68\x64\x00\x00\x00\x01\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x0c\x64\x69\x6e\x66"
-    b"\x00\x00\x00\x08\x64\x72\x65\x66\x00\x00\x00\x00\x00\x00\x00\x28"
-    b"\x73\x74\x62\x6c\x00\x00\x00\x1c\x73\x74\x73\x64\x00\x00\x00\x00"
-    b"\x00\x00\x00\x01\x00\x00\x00\x08\x61\x76\x63\x31\x00\x00\x00\x00"
-    b"\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
-    b"\x00\x00\x00\x10\x73\x74\x74\x73\x00\x00\x00\x00\x00\x00\x00\x01"
-    b"\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x1c\x73\x74\x73\x63"
-    b"\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x01"
-    b"\x00\x00\x00\x00\x00\x00\x00\x14\x73\x74\x73\x7a\x00\x00\x00\x00"
-    b"\x00\x00\x00\x01\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x14"
-    b"\x73\x74\x63\x6f\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00"
-    b"\x00\x00\x00\x08\x6d\x64\x61\x74\x00\x00\x00\x01\x0a"
-)
-
-
-def ensure_test_video():
-    """
-    确保本地存在测试替身 MP4 视频文件。
-    策略：优先从公网下载免版权样本视频；若网络不可达，
-    则用内置的最小 MP4 字节模板在本地自举生成一个合法 MP4 文件。
-    返回本地视频路径。
-    """
-    os.makedirs(OUTPUT_ASSETS_DIR, exist_ok=True)
-
-    if os.path.exists(TEST_VIDEO_PATH) and os.path.getsize(TEST_VIDEO_PATH) > 100:
-        return TEST_VIDEO_PATH
-
-    # 策略 1：从公网下载免版权样本视频
-    download_urls = [
-        "https://www.w3schools.com/html/mov_bbb.mp4",
-        "http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
-    ]
-    for url in download_urls:
-        try:
-            resp = requests.get(url, timeout=15, verify=False)
-            if resp.status_code == 200 and len(resp.content) > 1000:
-                with open(TEST_VIDEO_PATH, "wb") as f:
-                    f.write(resp.content)
-                return TEST_VIDEO_PATH
-        except Exception:
-            continue
-
-    # 策略 2：用内置字节模板在本地自举生成极简 MP4
-    try:
-        with open(TEST_VIDEO_PATH, "wb") as f:
-            f.write(_MINIMAL_MP4_BYTES)
-        return TEST_VIDEO_PATH
-    except Exception:
-        return None
 
 
 def _generate_jianying_draft(phase4_result: dict, phase1_result: dict,
@@ -859,35 +775,131 @@ def main():
                 st.session_state["pipeline_stage"] = "video_review"
                 st.rerun()
 
-    # ── 最终视频审核阶段（Phase 4 之后的终极闭环）──
+    # ── 最终成品审核阶段（Phase 4 之后的终极闭环）──
     elif stage == "video_review":
         st.divider()
+        st.success("## 🎬 最终成品预览 — 真实 AI 生成内容")
 
-        # 确保测试替身视频就绪
-        video_path = ensure_test_video()
-
-        if video_path and os.path.exists(video_path):
-            st.success("## 🎬 最终成品视频预览")
-
-            # 居中展示视频播放器
-            _, center_col, _ = st.columns([1, 3, 1])
-            with center_col:
-                try:
-                    st.video(video_path)
-                except Exception:
-                    st.warning("⚠️ 视频播放器加载失败，请检查文件格式。")
-                    st.caption(f"文件路径: {video_path}")
-                    st.caption(f"文件大小: {os.path.getsize(video_path)} bytes")
-
-            st.caption(
-                f"📁 本地视频路径: `{video_path}` | "
-                f"文件大小: {os.path.getsize(video_path) if os.path.exists(video_path) else 0} bytes"
-            )
-        else:
-            st.error("❌ 测试视频文件未能生成，请检查网络连接或磁盘空间。")
-
-        # 阶段四结果摘要（时间轴 + 特效方案）
+        phase3_result = st.session_state.get("phase3_result", {})
         phase4_result = st.session_state.get("phase4_result", {})
+        reviewed_visuals = st.session_state.get("reviewed_visuals", [])
+
+        # ── 音频播放区 ──
+        st.markdown("### 🎙 AI 配音（硅基流动 CosyVoice2）")
+        tts_data = phase3_result.get("tts", [])
+        live_audio_files = [
+            t for t in tts_data
+            if t.get("status") == "live" and t.get("audio_path", "").endswith(".mp3")
+        ]
+        fallback_audio = [
+            t for t in tts_data
+            if t.get("status") != "live" or not t.get("audio_path", "").endswith(".mp3")
+        ]
+
+        if live_audio_files:
+            audio_cols = st.columns(min(len(live_audio_files), 3))
+            for idx, audio in enumerate(live_audio_files):
+                with audio_cols[idx % 3]:
+                    audio_path = audio.get("audio_path", "")
+                    st.caption(f"片段 {audio.get('segment_index', idx + 1)}: "
+                               f"{audio.get('text', '')[:60]}...")
+                    if os.path.exists(audio_path) and os.path.getsize(audio_path) > 100:
+                        try:
+                            st.audio(audio_path, format="audio/mp3")
+                        except Exception:
+                            st.warning("⚠️ 音频加载失败")
+                    else:
+                        st.warning("⚠️ 音频文件为空或不存在")
+        else:
+            st.warning("⚠️ 没有真实 AI 配音数据。请检查硅基流动 API Key 配置。")
+
+        if fallback_audio:
+            with st.expander(f"📋 {len(fallback_audio)} 段降级配音详情", expanded=False):
+                for fa in fallback_audio:
+                    st.caption(
+                        f"[{fa.get('status', '?')}] "
+                        f"{fa.get('text', 'N/A')[:80]}..."
+                    )
+
+        st.divider()
+
+        # ── 视觉成品展示区 ──
+        st.markdown("### 🎥 AI 生成视觉素材（海螺AI MiniMax）")
+        visuals_to_show = reviewed_visuals if reviewed_visuals else phase3_result.get(
+            "visual", []
+        )
+
+        # 检查是否有真实图片/视频
+        real_images = [
+            v for v in visuals_to_show
+            if v.get("type") == "image" and v.get("status") == "live"
+            and v.get("file_path", "").endswith((".png", ".jpg", ".jpeg"))
+        ]
+        real_videos = [
+            v for v in visuals_to_show
+            if v.get("type") == "video" and v.get("status") == "live"
+            and v.get("file_path", "").endswith(".mp4")
+        ]
+        fallback_visuals = [
+            v for v in visuals_to_show
+            if v.get("status") != "live"
+            or not v.get("file_path", "").endswith((".png", ".jpg", ".jpeg", ".mp4"))
+        ]
+
+        if real_images or real_videos:
+            # 真实视频（如果有）
+            if real_videos:
+                st.markdown("#### 🎬 AI 生成视频片段")
+                for vid in real_videos:
+                    st.caption(
+                        f"Prompt: {vid.get('prompt', 'N/A')[:100]}..."
+                    )
+                    if os.path.exists(vid["file_path"]) and os.path.getsize(vid["file_path"]) > 1000:
+                        try:
+                            st.video(vid["file_path"])
+                        except Exception:
+                            st.warning("⚠️ 视频播放失败")
+                    else:
+                        st.caption(f"  状态: {vid.get('status', '?')} — 视频文件不可用")
+
+            # 真实图片
+            if real_images:
+                st.markdown("#### 🖼 AI 生成图片")
+                img_cols = st.columns(min(len(real_images), 3))
+                for idx, img in enumerate(real_images):
+                    with img_cols[idx % 3]:
+                        st.caption(
+                            f"时间戳: {img.get('duration_seconds', '?')}s"
+                        )
+                        if os.path.exists(img["file_path"]) and os.path.getsize(img["file_path"]) > 100:
+                            try:
+                                st.image(img["file_path"], use_container_width=True)
+                            except Exception:
+                                st.warning("⚠️ 图片加载失败")
+                        else:
+                            st.warning("⚠️ 图片文件为空或不存在")
+                        st.caption(
+                            f"Prompt: {img.get('prompt', 'N/A')[:80]}..."
+                        )
+        else:
+            st.warning(
+                "⚠️ 没有真实 AI 生成的视觉素材。"
+                "请检查海螺AI (MiniMax) API Key 配置。"
+            )
+
+        if fallback_visuals:
+            with st.expander(
+                f"📋 {len(fallback_visuals)} 个降级/失败素材详情", expanded=False
+            ):
+                for fv in fallback_visuals:
+                    st.caption(
+                        f"[{fv.get('type', '?')}] status={fv.get('status', '?')} | "
+                        f"{fv.get('prompt', 'N/A')[:100]}..."
+                    )
+
+        st.divider()
+
+        # 阶段四结果摘要
         timeline = phase4_result.get("timeline", {})
         effects = phase4_result.get("effects_plan", {})
         stats = timeline.get("alignment_stats", {})
@@ -907,7 +919,7 @@ def main():
 
         # 终极确认闸门
         st.warning(
-            "⚠️ **最终审核闸门！** 请人类指挥官观看上方视频成品，"
+            "⚠️ **最终审核闸门！** 请人类指挥官审核上方 AI 生成的音频和视觉素材，"
             "确认无误后点击下方按钮，系统将生成剪映底层草稿文件。"
         )
         if st.button(
@@ -915,7 +927,6 @@ def main():
             type="primary",
             use_container_width=True,
         ):
-            # 生成剪映底层草稿（JSON 格式，可直接导入剪映）
             jianying_draft = _generate_jianying_draft(
                 phase4_result,
                 st.session_state.get("phase1_result", {}),

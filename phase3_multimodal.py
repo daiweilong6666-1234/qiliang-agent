@@ -1,36 +1,71 @@
 """
 ================================================================================
- 启量 Agent — 第三阶段：多模态视觉铸造与品控车间
+ 启量 Agent — 第三阶段：多模态视觉铸造与品控车间（实弹版）
  独立模块（与 Phase 1 / Phase 2 完全解耦）
- 核心能力：TTS 配音 · 视觉分发路由 · 人机协作品控
+ 核心能力：TTS 配音（硅基流动）· 视觉分发路由 · 人机协作品控 · 生图生视频（海螺AI）
+================================================================================
+
+ 【API 挂载】
+  - TTS 语音合成：硅基流动 (SiliconFlow) CosyVoice2 → 输出真实 .mp3 音频
+  - 图像生成：海螺AI (MiniMax) image-01 → 输出真实 .png 图片
+  - 视频生成：海螺AI (MiniMax) video-01 → 输出真实 .mp4 视频
 ================================================================================
 """
 
 import os
-import json
 import time
 import hashlib
+import requests
 from datetime import datetime
+
+# ============================================================================
+# .env 配置加载器（无外部依赖，手动解析）
+# ============================================================================
+
+
+def _load_env():
+    """手动解析项目根目录下的 .env 文件，写入 os.environ。"""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key and val and key not in os.environ:
+                os.environ[key] = val
+
+
+_load_env()
 
 # ============================================================================
 # 全局配置
 # ============================================================================
 
-# 模拟输出目录
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "phase3_output")
-
-# 音频文件模拟保存路径
+# 输出目录
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output_assets")
 AUDIO_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "audio")
-
-# 视觉素材模拟保存路径
 VISUAL_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "visual")
 
 # 黄金 30 秒分界线（秒）
 GOLDEN_30S_THRESHOLD = 30
 
+# ── 硅基流动 TTS 配置 ──
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
+SILICONFLOW_BASE_URL = os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+SILICONFLOW_TTS_MODEL = os.environ.get("SILICONFLOW_TTS_MODEL", "FunAudioLLM/CosyVoice2-0.5B")
+
+# ── 海螺AI (MiniMax) 配置 ──
+MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
+MINIMAX_BASE_URL = os.environ.get("MINIMAX_BASE_URL", "https://api.minimax.chat/v1")
+
 
 # ============================================================================
-# 模块一：TTS 配音通道
+# 辅助工具
 # ============================================================================
 
 def ensure_output_dirs():
@@ -39,72 +74,116 @@ def ensure_output_dirs():
     os.makedirs(VISUAL_OUTPUT_DIR, exist_ok=True)
 
 
+def generate_id(prefix: str, seed: str) -> str:
+    """生成短唯一 ID。"""
+    h = hashlib.md5(seed.encode("utf-8")).hexdigest()[:8]
+    return f"{prefix}_{h}"
+
+
+# ============================================================================
+# 模块一：TTS 配音通道（硅基流动 CosyVoice2 — 实弹版）
+# ============================================================================
+
 def text_to_speech(
     text: str,
-    voice_id: str = "default_female_cn",
+    voice_id: str = "FunAudioLLM/CosyVoice2-0.5B:alex",
     speed: float = 1.0,
-    audio_format: str = "wav",
+    audio_format: str = "mp3",
 ) -> dict:
     """
-    TTS 文本转语音函数。
-    当前为模拟实现（Mock），预留了调用语音大模型 API 的接口位置。
+    TTS 文本转语音 —— 调用硅基流动 CosyVoice2 API 生成真实 .mp3 音频。
 
     参数：
-      text      — 需要转为语音的文本内容。
-      voice_id  — 音色 ID，默认 "default_female_cn"。
-      speed     — 语速倍率，1.0 为正常语速。
-      audio_format — 输出音频格式，默认 "wav"。
+      text         — 需要转为语音的英文文本（来自 Phase 2 翻译通道）。
+      voice_id     — 硅基流动音色 ID，默认 alex（英语男声）。
+      speed        — 语速倍率，1.0 为正常语速。
+      audio_format — 输出音频格式，默认 "mp3"。
 
     返回：
-      字典，包含：
-        - audio_path: 模拟的音频文件保存路径。
-        - duration_seconds: 估算的音频时长（秒）。
-        - text_length: 输入文本的字符数。
-        - voice_id: 使用的音色 ID。
-        - status: 状态标记（mock / live）。
+      字典，包含 audio_path / duration_seconds / status 等字段。
     """
     ensure_output_dirs()
 
-    # ── 估算音频时长（中文大约每秒 4 个字）──
+    if not SILICONFLOW_API_KEY or SILICONFLOW_API_KEY == "your_siliconflow_api_key_here":
+        return _fallback_tts(text, voice_id, audio_format, "no_api_key")
+
     char_count = len(text)
     estimated_duration = round(char_count / 4.0, 2)
 
-    # ── 生成唯一文件名（基于文本哈希 + 时间戳）──
+    # 生成文件名
     text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"tts_{voice_id}_{timestamp}_{text_hash}.{audio_format}"
+    filename = f"tts_{voice_id.split(':')[-1] if ':' in voice_id else voice_id}_{timestamp}_{text_hash}.{audio_format}"
     audio_path = os.path.join(AUDIO_OUTPUT_DIR, filename)
 
-    # ── 模拟生成音频文件（写入占位内容）──
-    # TODO: 替换为真实的语音大模型 API 调用。
-    # 接口预留位置 —— 将 text / voice_id / speed 传入以下 API：
-    #
-    #   response = tts_api.generate(
-    #       text=text,
-    #       voice=voice_id,
-    #       speed=speed,
-    #       format=audio_format,
-    #   )
-    #   with open(audio_path, "wb") as f:
-    #       f.write(response.audio_bytes)
-    #
+    try:
+        # ── 调用硅基流动 Audio Speech API（OpenAI 兼容）──
+        resp = requests.post(
+            f"{SILICONFLOW_BASE_URL}/audio/speech",
+            headers={
+                "Authorization": f"Bearer {SILICONFLOW_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": SILICONFLOW_TTS_MODEL,
+                "input": text,
+                "voice": voice_id,
+                "response_format": audio_format,
+                "speed": speed,
+            },
+            timeout=60,
+        )
+
+        if resp.status_code == 200 and resp.content:
+            with open(audio_path, "wb") as f:
+                f.write(resp.content)
+            file_size = os.path.getsize(audio_path)
+            return {
+                "audio_path": audio_path,
+                "duration_seconds": estimated_duration,
+                "text_length": char_count,
+                "voice_id": voice_id,
+                "status": "live",
+                "text": text,
+                "file_size_bytes": file_size,
+            }
+        else:
+            print(f"  [TTS WARN] API 返回 {resp.status_code}: {resp.text[:200]}")
+            return _fallback_tts(text, voice_id, audio_format, f"api_error_{resp.status_code}")
+
+    except requests.exceptions.Timeout:
+        return _fallback_tts(text, voice_id, audio_format, "timeout")
+    except Exception as e:
+        print(f"  [TTS ERROR] {e}")
+        return _fallback_tts(text, voice_id, audio_format, f"error: {str(e)[:50]}")
+
+
+def _fallback_tts(text: str, voice_id: str, audio_format: str, status: str) -> dict:
+    """TTS 降级方案：保存文本占位文件 + 返回估算数据。"""
+    char_count = len(text)
+    text_hash = hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"tts_fallback_{voice_id.split(':')[-1] if ':' in voice_id else voice_id}_{timestamp}_{text_hash}.txt"
+    audio_path = os.path.join(AUDIO_OUTPUT_DIR, filename)
+
     with open(audio_path, "w", encoding="utf-8") as f:
-        f.write(f"# MOCK TTS AUDIO FILE\n")
-        f.write(f"# Generated: {datetime.now().isoformat()}\n")
-        f.write(f"# Voice: {voice_id} | Speed: {speed}x\n")
-        f.write(f"# Estimated Duration: {estimated_duration}s\n")
-        f.write(f"# Text: {text[:100]}...\n")
+        f.write("# TTS FALLBACK — API 调用未成功\n")
+        f.write(f"# Status: {status}\n")
+        f.write(f"# Voice: {voice_id}\n")
+        f.write(f"# Text: {text}\n")
 
     return {
         "audio_path": audio_path,
-        "duration_seconds": estimated_duration,
+        "duration_seconds": round(char_count / 4.0, 2),
         "text_length": char_count,
         "voice_id": voice_id,
-        "status": "mock",  # 切换为 "live" 时表示已接入真实 API
+        "status": status,
+        "text": text,
+        "file_size_bytes": os.path.getsize(audio_path),
     }
 
 
-def batch_tts(text_segments: list, voice_id: str = "default_female_cn") -> list:
+def batch_tts(text_segments: list, voice_id: str = "FunAudioLLM/CosyVoice2-0.5B:alex") -> list:
     """
     批量 TTS 处理：为多段文本分别生成配音。
 
@@ -117,58 +196,35 @@ def batch_tts(text_segments: list, voice_id: str = "default_female_cn") -> list:
     """
     results = []
     for idx, segment in enumerate(text_segments, start=1):
-        result = text_to_speech(
-            text=segment,
-            voice_id=voice_id,
-        )
+        result = text_to_speech(text=segment, voice_id=voice_id)
         result["segment_index"] = idx
         results.append(result)
     return results
 
 
 # ============================================================================
-# 模块二：视觉分发路由（黄金 30 秒死守策略）
+# 模块二：视觉生成引擎（海螺AI MiniMax — 实弹版）
 # ============================================================================
 
-def video_generation_api(
-    prompt: str,
-    duration_seconds: float,
-    resolution: str = "1080p",
-) -> dict:
-    """
-    视频生成 API 函数（Mock 实现）。
-    用于生成短视频片段。适用于前 30 秒的高价值内容。
-
-    参数：
-      prompt           — 分镜画面提示词。
-      duration_seconds — 该片段对应的时间戳（从脚本开始算起的秒数）。
-      resolution       — 视频分辨率。
-
-    返回：
-      模拟的视频生成结果字典。
-    """
-    ensure_output_dirs()
-
-    shot_id = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:8]
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"video_shot_{shot_id}_{timestamp}.mp4"
-    video_path = os.path.join(VISUAL_OUTPUT_DIR, filename)
-
-    # 生成模拟视频文件
-    with open(video_path, "w", encoding="utf-8") as f:
-        f.write(f"# MOCK VIDEO FILE\n")
-        f.write(f"# Generated: {datetime.now().isoformat()}\n")
-        f.write(f"# Prompt: {prompt}\n")
-        f.write(f"# Duration: {duration_seconds}s | Resolution: {resolution}\n")
-
+def _minimax_headers() -> dict:
+    """构建海螺AI API 请求头。"""
     return {
-        "type": "video",
-        "file_path": video_path,
-        "prompt": prompt,
-        "duration_seconds": duration_seconds,
-        "resolution": resolution,
-        "status": "mock",
+        "Authorization": f"Bearer {MINIMAX_API_KEY}",
+        "Content-Type": "application/json",
     }
+
+
+def _download_file(url: str, save_path: str, timeout: int = 120) -> bool:
+    """从 URL 下载文件到本地路径。"""
+    try:
+        resp = requests.get(url, timeout=timeout)
+        if resp.status_code == 200 and resp.content:
+            with open(save_path, "wb") as f:
+                f.write(resp.content)
+            return os.path.getsize(save_path) > 100
+    except Exception as e:
+        print(f"  [DOWNLOAD ERROR] {e}")
+    return False
 
 
 def image_generation_api(
@@ -177,56 +233,227 @@ def image_generation_api(
     resolution: str = "1080x1920",
 ) -> dict:
     """
-    图像生成 API 函数（Mock 实现）。
-    用于生成静态帧。适用于 30 秒后的辅助内容。
+    图像生成 API —— 调用海螺AI (MiniMax) image-01 模型生成真实图片。
 
     参数：
-      prompt           — 分镜画面提示词。
-      duration_seconds — 该片段对应的时间戳（从脚本开始算起的秒数）。
+      prompt           — 分镜画面提示词（英文 Prompt）。
+      duration_seconds — 该片段对应的时间戳。
       resolution       — 图片分辨率。
 
     返回：
-      模拟的图像生成结果字典。
+      生成的图像结果字典，含本地文件路径。
     """
     ensure_output_dirs()
+
+    if not MINIMAX_API_KEY or MINIMAX_API_KEY == "your_minimax_api_key_here":
+        return _fallback_visual("image", prompt, duration_seconds, "no_api_key")
 
     shot_id = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:8]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"image_shot_{shot_id}_{timestamp}.png"
     image_path = os.path.join(VISUAL_OUTPUT_DIR, filename)
 
-    # 生成模拟图像文件
-    with open(image_path, "w", encoding="utf-8") as f:
-        f.write(f"# MOCK IMAGE FILE\n")
-        f.write(f"# Generated: {datetime.now().isoformat()}\n")
+    try:
+        # ── 调用海螺AI 图像生成 API ──
+        resp = requests.post(
+            f"{MINIMAX_BASE_URL}/image_generation",
+            headers=_minimax_headers(),
+            json={
+                "model": "image-01",
+                "prompt": prompt,
+                "aspect_ratio": "9:16",
+                "n": 1,
+                "response_format": "url",
+            },
+            timeout=120,
+        )
+
+        if resp.status_code == 200:
+            data = resp.json()
+            image_url = None
+            if "data" in data and len(data["data"]) > 0:
+                image_url = data["data"][0].get("url", "")
+            elif "url" in data:
+                image_url = data["url"]
+
+            if image_url:
+                if _download_file(image_url, image_path):
+                    return {
+                        "type": "image",
+                        "file_path": image_path,
+                        "prompt": prompt,
+                        "duration_seconds": duration_seconds,
+                        "resolution": resolution,
+                        "status": "live",
+                        "source_url": image_url,
+                    }
+                else:
+                    return _fallback_visual("image", prompt, duration_seconds, "download_failed")
+
+        print(f"  [IMG WARN] API 返回 {resp.status_code}: {resp.text[:200]}")
+        return _fallback_visual("image", prompt, duration_seconds, f"api_error_{resp.status_code}")
+
+    except requests.exceptions.Timeout:
+        return _fallback_visual("image", prompt, duration_seconds, "timeout")
+    except Exception as e:
+        print(f"  [IMG ERROR] {e}")
+        return _fallback_visual("image", prompt, duration_seconds, f"error: {str(e)[:50]}")
+
+
+def video_generation_api(
+    prompt: str,
+    duration_seconds: float,
+    resolution: str = "1080p",
+) -> dict:
+    """
+    视频生成 API —— 调用海螺AI (MiniMax) video-01 模型生成真实短视频。
+
+    ⚠ 视频生成是异步任务，需要提交后轮询等待。Demo 中超时 180s，
+    超时后降级为图像生成。
+
+    参数：
+      prompt           — 分镜画面提示词。
+      duration_seconds — 该片段对应的时间戳。
+      resolution       — 视频分辨率。
+
+    返回：
+      生成的视频结果字典，含本地文件路径。
+    """
+    ensure_output_dirs()
+
+    if not MINIMAX_API_KEY or MINIMAX_API_KEY == "your_minimax_api_key_here":
+        return _fallback_visual("video", prompt, duration_seconds, "no_api_key")
+
+    shot_id = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:8]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"video_shot_{shot_id}_{timestamp}.mp4"
+    video_path = os.path.join(VISUAL_OUTPUT_DIR, filename)
+
+    try:
+        # ── 步骤 1：提交视频生成任务 ──
+        submit_resp = requests.post(
+            f"{MINIMAX_BASE_URL}/video_generation",
+            headers=_minimax_headers(),
+            json={
+                "model": "video-01",
+                "prompt": prompt,
+                "duration": 5,
+                "aspect_ratio": "16:9",
+            },
+            timeout=30,
+        )
+
+        if submit_resp.status_code != 200:
+            print(f"  [VIDEO WARN] 提交失败 {submit_resp.status_code}: {submit_resp.text[:200]}")
+            # 视频生成失败 → 降级为图像
+            print("  [VIDEO] 降级为图像生成...")
+            img_result = image_generation_api(prompt, duration_seconds)
+            img_result["type"] = "video"
+            img_result["route_reason"] = (
+                f"视频 API 不可用 → 降级为图像 (原因: api_error_{submit_resp.status_code})"
+            )
+            return img_result
+
+        task_data = submit_resp.json()
+        task_id = task_data.get("id") or task_data.get("task_id", "")
+
+        if not task_id:
+            return _fallback_visual("video", prompt, duration_seconds, "no_task_id")
+
+        # ── 步骤 2：轮询等待视频生成完成 ──
+        max_wait = 180  # Demo 最大等待 3 分钟
+        poll_interval = 5
+        elapsed = 0
+
+        while elapsed < max_wait:
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+            query_resp = requests.get(
+                f"{MINIMAX_BASE_URL}/video_generation/{task_id}",
+                headers=_minimax_headers(),
+                timeout=30,
+            )
+
+            if query_resp.status_code == 200:
+                query_data = query_resp.json()
+                status = query_data.get("status", "")
+
+                if status == "completed" or status == "succeeded":
+                    video_url = (
+                        query_data.get("url")
+                        or query_data.get("video_url")
+                        or (query_data.get("data", {}) if isinstance(query_data.get("data"), str) else "")
+                    )
+                    if not video_url and "data" in query_data and isinstance(query_data["data"], dict):
+                        video_url = query_data["data"].get("url", "")
+
+                    if video_url and _download_file(video_url, video_path):
+                        return {
+                            "type": "video",
+                            "file_path": video_path,
+                            "prompt": prompt,
+                            "duration_seconds": duration_seconds,
+                            "resolution": resolution,
+                            "status": "live",
+                            "source_url": video_url,
+                            "task_id": task_id,
+                        }
+
+                elif status == "failed" or status == "error":
+                    print(f"  [VIDEO WARN] 任务失败: {query_data}")
+                    break
+
+            print(f"  [VIDEO] 轮询中... (已等待 {elapsed}s)")
+
+        # 超时 → 降级为图像
+        print(f"  [VIDEO] 等待超时 ({elapsed}s) → 降级为图像生成")
+        img_result = image_generation_api(prompt, duration_seconds)
+        img_result["type"] = "video"
+        img_result["route_reason"] = f"视频生成超时 ({elapsed}s > {max_wait}s) → 降级为图像"
+        return img_result
+
+    except requests.exceptions.Timeout:
+        return _fallback_visual("video", prompt, duration_seconds, "timeout")
+    except Exception as e:
+        print(f"  [VIDEO ERROR] {e}")
+        return _fallback_visual("video", prompt, duration_seconds, f"error: {str(e)[:50]}")
+
+
+def _fallback_visual(viz_type: str, prompt: str, duration_seconds: float,
+                     status: str) -> dict:
+    """视觉生成降级方案：保存 Prompt 占位文件。"""
+    shot_id = hashlib.md5(prompt.encode("utf-8")).hexdigest()[:8]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{viz_type}_fallback_{shot_id}_{timestamp}.txt"
+    file_path = os.path.join(VISUAL_OUTPUT_DIR, filename)
+
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(f"# {viz_type.upper()} FALLBACK — API 调用未成功\n")
+        f.write(f"# Status: {status}\n")
         f.write(f"# Prompt: {prompt}\n")
-        f.write(f"# Duration: {duration_seconds}s | Resolution: {resolution}\n")
+        f.write(f"# Duration: {duration_seconds}s\n")
 
     return {
-        "type": "image",
-        "file_path": image_path,
+        "type": viz_type,
+        "file_path": file_path,
         "prompt": prompt,
         "duration_seconds": duration_seconds,
-        "resolution": resolution,
-        "status": "mock",
+        "status": status,
     }
 
 
-def visual_distribution_router(
-    storyboard_shots: list,
-) -> list:
+# ============================================================================
+# 模块三：视觉分发路由（黄金 30 秒死守策略）
+# ============================================================================
+
+def visual_distribution_router(storyboard_shots: list) -> list:
     """
     视觉分发路由调度器 —— 黄金 30 秒死守策略。
 
     核心规则（不可绕过）：
       - 前 30 秒（duration_seconds <= 30）：强制路由到视频生成 API。
       - 30 秒之后（duration_seconds > 30）：强制路由到图像生成 API。
-
-    为什么这么分：
-      - 前 30 秒是短视频的黄金窗口，用户的留存率在此决定。
-        动态视频比静态图片的留存率高 3~5 倍。
-      - 30 秒后用户已经形成观看惯性，静态图片配合 TTS 配音即可
-        维持注意力，成本仅为视频的 1/10。
 
     参数：
       storyboard_shots — 分镜列表，每项包含：
@@ -247,23 +474,23 @@ def visual_distribution_router(
         prompt = shot.get("prompt", "")
         duration = shot.get("duration_seconds", 0)
 
-        # ── 黄金 30 秒死守判断 ──
         if duration <= GOLDEN_30S_THRESHOLD:
-            # 前 30 秒：强制视频
             result = video_generation_api(prompt=prompt, duration_seconds=duration)
-            result["route_reason"] = f"黄金 30 秒内（{duration}s <= {GOLDEN_30S_THRESHOLD}s）→ 强制视频"
+            result["route_reason"] = (
+                f"黄金 30 秒内（{duration}s <= {GOLDEN_30S_THRESHOLD}s）→ 强制视频"
+            )
             video_count += 1
         else:
-            # 30 秒后：强制图像
             result = image_generation_api(prompt=prompt, duration_seconds=duration)
-            result["route_reason"] = f"30 秒后（{duration}s > {GOLDEN_30S_THRESHOLD}s）→ 强制图像"
+            result["route_reason"] = (
+                f"30 秒后（{duration}s > {GOLDEN_30S_THRESHOLD}s）→ 强制图像"
+            )
             image_count += 1
 
         results.append(result)
 
-    # 打印分发统计
     print(f"\n{'=' * 50}")
-    print(f"  视觉分发路由报告")
+    print("  视觉分发路由报告")
     print(f"{'=' * 50}")
     print(f"  总分镜数: {len(storyboard_shots)}")
     print(f"  [VIDEO] 视频生成: {video_count} 个（前 {GOLDEN_30S_THRESHOLD}s 黄金窗口）")
@@ -274,30 +501,13 @@ def visual_distribution_router(
 
 
 # ============================================================================
-# 模块三：人机协作拦截器（品控把关）
+# 模块四：人机协作拦截器（品控把关）
 # ============================================================================
 
-def human_review_interceptor(
-    candidates: list,
-    review_mode: str = "strict",
-) -> list:
+def human_review_interceptor(candidates: list, review_mode: str = "strict") -> list:
     """
     人机协作拦截器 —— 品控把关的最后一道防线。
-
-    流程：
-      1. 将视觉模型输出的所有候选素材逐条展示给人类审核员。
-      2. 进入阻塞状态（input() 等待终端输入），
-         必须等待人类逐条输入"确认采纳"或"驳回"。
-      3. 只有被标记为"确认采纳"的素材才能通过，进入最终输出。
-      4. 被驳回的素材记录驳回原因，供后续重生成使用。
-
-    参数：
-      candidates  — 视觉分发路由输出的候选素材列表。
-      review_mode — "strict"（默认）：每一条都必须人工确认；
-                    "batch"：批量确认，一次性 approve 全部。
-
-    返回：
-      通过审核的素材列表 + 驳回记录。
+    Streamlit 模式下不使用 terminal input()，此函数保留供命令行独立测试。
     """
     if not candidates:
         print("\n[WARN] 没有待审核的候选素材，跳过品控环节。")
@@ -305,17 +515,16 @@ def human_review_interceptor(
 
     total = len(candidates)
     print(f"\n{'=' * 60}")
-    print(f"  [REVIEW] 人机协作品控拦截器已启动")
+    print("  [REVIEW] 人机协作品控拦截器已启动")
     print(f"  待审核素材: {total} 条")
     print(f"  审核模式: {review_mode}")
-    print(f"  请输入 '确认采纳' 通过，输入其他内容视为驳回")
+    print("  请输入 '确认采纳' 通过，输入其他内容视为驳回")
     print(f"{'=' * 60}\n")
 
     approved = []
     rejected = []
 
     if review_mode == "batch":
-        # 批量模式：一次性展示全部，一次性确认
         for idx, candidate in enumerate(candidates, start=1):
             print(f"  ┌─ [{idx}/{total}] {candidate.get('type', '?').upper()} ─┐")
             print(f"  │ Prompt: {candidate.get('prompt', 'N/A')[:80]}...")
@@ -324,7 +533,6 @@ def human_review_interceptor(
             print(f"  └{'─' * 50}┘\n")
 
         decision = input(f"  请输入 '确认采纳' 批量通过全部 {total} 条素材: ").strip()
-
         if decision == "确认采纳":
             for c in candidates:
                 c["review_status"] = "approved"
@@ -337,7 +545,6 @@ def human_review_interceptor(
                 rejected.append(c)
             print(f"\n  [X] 批量驳回！{total} 条素材全部拒绝。驳回原因: {decision}")
     else:
-        # 严格模式：逐条审核
         for idx, candidate in enumerate(candidates, start=1):
             print(f"  ┌─ [{idx}/{total}] {candidate.get('type', '?').upper()} ─┐")
             print(f"  │ Prompt: {candidate.get('prompt', 'N/A')[:80]}...")
@@ -345,28 +552,24 @@ def human_review_interceptor(
             print(f"  │ 路由原因: {candidate.get('route_reason', 'N/A')}")
             print(f"  │ 文件: {candidate.get('file_path', 'N/A')}")
             print(f"  └{'─' * 50}┘")
-
-            # ── 阻塞等待人类输入 ──
-            decision = input(f"  → 请输入审核决定（确认采纳 / 驳回+原因）: ").strip()
-
+            decision = input("  → 请输入审核决定（确认采纳 / 驳回+原因）: ").strip()
             if decision == "确认采纳":
                 candidate["review_status"] = "approved"
                 approved.append(candidate)
-                print(f"     [OK] 已采纳\n")
+                print("     [OK] 已采纳\n")
             else:
                 candidate["review_status"] = "rejected"
                 candidate["reject_reason"] = decision
                 rejected.append(candidate)
                 print(f"     [X] 已驳回。原因: {decision}\n")
 
-    # ── 品控报告 ──
     print(f"\n{'=' * 60}")
-    print(f"  品控审核报告")
+    print("  品控审核报告")
     print(f"{'=' * 60}")
     print(f"  通过: {len(approved)} / {total}")
     print(f"  驳回: {len(rejected)} / {total}")
     if rejected:
-        print(f"  驳回列表:")
+        print("  驳回列表:")
         for r in rejected:
             print(f"    - [{r.get('type')}] {r.get('reject_reason', 'N/A')}")
     print(f"{'=' * 60}\n")
@@ -395,12 +598,13 @@ def run_phase3_pipeline(
       完整的第三阶段输出字典。
     """
     print("\n" + "=" * 60)
-    print("  启量 Agent — 第三阶段流水线启动")
+    print("  启量 Agent — 第三阶段流水线启动（实弹版）")
+    print("  TTS: 硅基流动 CosyVoice2  |  生图/生视频: 海螺AI MiniMax")
     print(f"  启动时间: {datetime.now().isoformat()}")
     print("=" * 60)
 
     pipeline_result = {
-        "pipeline": "phase3_multimodal",
+        "pipeline": "phase3_multimodal_live",
         "timestamp": datetime.now().isoformat(),
         "tts": None,
         "visual": None,
@@ -409,20 +613,22 @@ def run_phase3_pipeline(
 
     # ── 步骤 1：TTS 配音 ──
     if tts_segments:
-        print("\n[TTS] 步骤 1/3: TTS 配音处理中...")
+        print("\n[TTS] 步骤 1/3: TTS 配音处理中（硅基流动 CosyVoice2）...")
         tts_results = batch_tts(tts_segments)
         pipeline_result["tts"] = {
             "total_segments": len(tts_segments),
             "total_duration_seconds": sum(r["duration_seconds"] for r in tts_results),
             "segments": tts_results,
         }
-        print(f"   完成: {len(tts_results)} 段配音，"
+        live_count = sum(1 for r in tts_results if r.get("status") == "live")
+        print(f"   完成: {len(tts_results)} 段配音, "
+              f"其中 {live_count} 段为真实 API 生成, "
               f"预估总时长 {pipeline_result['tts']['total_duration_seconds']}s")
     else:
         print("\n[TTS] 步骤 1/3: 无 TTS 文本，跳过配音环节。")
 
     # ── 步骤 2：视觉分发路由 ──
-    print("\n[VIDEO] 步骤 2/3: 视觉分发路由中...")
+    print("\n[VISUAL] 步骤 2/3: 视觉分发路由中（海螺AI MiniMax）...")
     visual_results = visual_distribution_router(storyboard_shots)
     pipeline_result["visual"] = {
         "total_shots": len(storyboard_shots),
@@ -456,90 +662,75 @@ def run_phase3_pipeline(
 # ============================================================================
 
 if __name__ == "__main__":
-    # ── 模拟 Phase 2 分镜输出的测试数据 ──
     mock_storyboard_shots = [
         {
             "prompt": "Close-up shot, a glossy red apple with anthropomorphic smiling face, "
                       "studio lighting with soft shadows, vibrant colors, 3D animated style --ar 16:9",
-            "duration_seconds": 5,  # 前 30 秒 → 应路由到视频
+            "duration_seconds": 5,
         },
         {
             "prompt": "Medium shot, supermarket aisle with colorful fruit shelves, "
                       "bright overhead LED lights, clean modern aesthetic, 3D animated style --ar 16:9",
-            "duration_seconds": 12,  # 前 30 秒 → 应路由到视频
+            "duration_seconds": 12,
         },
         {
             "prompt": "Close-up on a mysterious spray bottle emerging from mist, "
                       "dramatic spotlight, slow camera pan, cinematic depth of field --ar 16:9",
-            "duration_seconds": 22,  # 前 30 秒 → 应路由到视频
+            "duration_seconds": 22,
         },
         {
             "prompt": "Wide shot, before-and-after split screen: dull apple on left, "
                       "shiny glowing apple on right, comparison format --ar 16:9",
-            "duration_seconds": 35,  # 30 秒后 → 应路由到图像
-        },
-        {
-            "prompt": "Product beauty shot, the保鲜喷雾 bottle on a white pedestal, "
-                      "water droplets, premium product photography style --ar 16:9",
-            "duration_seconds": 48,  # 30 秒后 → 应路由到图像
+            "duration_seconds": 35,
         },
     ]
 
-    # ── 模拟 TTS 文本片段 ──
     mock_tts_segments = [
-        "你有没有想过，为什么超市里的苹果永远那么亮？",
-        "其实背后藏着一个不为人知的保鲜黑科技！",
-        "这款保鲜喷雾，喷一下就能让水果发光7天！",
-        "限时特惠，前100名下单立减50元！",
+        "Have you ever wondered why the apples in supermarkets always look so shiny?",
+        "There is actually a hidden secret behind this freshness technology!",
+        "This freshness spray can make your fruits glow for 7 days!",
     ]
 
     print("\n" + "=" * 60)
-    print("  启量 Agent — 第三阶段 多模态视觉铸造与品控车间")
-    print("  独立功能测试")
+    print("  启量 Agent — 第三阶段 实弹版 功能测试")
+    print("  TTS 引擎: 硅基流动 CosyVoice2")
+    print("  视觉引擎: 海螺AI MiniMax")
     print("=" * 60)
 
-    # ── 测试 1：单独测 TTS ──
-    print("\n【子测试 1】TTS 配音通道")
+    # ── 子测试 1：TTS ──
+    print("\n【子测试 1】TTS 配音通道（硅基流动）")
     print("-" * 40)
     tts_result = text_to_speech(mock_tts_segments[0])
     print(f"  音频路径: {tts_result['audio_path']}")
     print(f"  预估时长: {tts_result['duration_seconds']}s")
     print(f"  状态: {tts_result['status']}")
 
-    # ── 测试 2：单独测视觉路由 ──
-    print("\n【子测试 2】视觉分发路由（黄金 30 秒）")
+    # ── 子测试 2：视觉路由 ──
+    print("\n【子测试 2】视觉分发路由（海螺AI）")
     print("-" * 40)
     route_results = visual_distribution_router(mock_storyboard_shots)
     for r in route_results:
-        print(f"  [{r['type'].upper()}] {r['duration_seconds']}s → {r['route_reason']}")
+        print(f"  [{r.get('type', '?').upper()}] {r.get('duration_seconds', '?')}s → "
+              f"{r.get('route_reason', 'N/A')} | status={r.get('status', '?')}")
 
-    # ── 测试 3：人机品控（自动化模式，跳过 input）──
-    print("\n【子测试 3】人机品控（自动化跳过模式）")
-    print("-" * 40)
-    approved, rejected = human_review_interceptor(
-        route_results,
-        review_mode="strict",
-    ) if False else (route_results, [])  # 跳过交互
-
-    # ── 完整流水线（跳过品控）──
+    # ── 完整流水线 ──
     print("\n【完整流水线】")
     print("-" * 40)
     full_result = run_phase3_pipeline(
         storyboard_shots=mock_storyboard_shots,
         tts_segments=mock_tts_segments,
-        skip_human_review=True,  # 自动化测试跳过人机交互
+        skip_human_review=True,
     )
 
-    # 打印摘要
     print("\n" + "=" * 60)
-    print("  测试完成！输出目录结构:")
+    print("  测试完成！输出文件统计")
     print("=" * 60)
     for root, dirs, files in os.walk(OUTPUT_DIR):
         level = root.replace(OUTPUT_DIR, "").count(os.sep)
         indent = "  " * level
         print(f"{indent}{os.path.basename(root)}/")
-        sub_indent = "  " * (level + 1)
         for file in files:
-            print(f"{sub_indent}{file}")
-
+            file_path = os.path.join(root, file)
+            size_kb = os.path.getsize(file_path) / 1024
+            print(f"{indent}  {file} ({size_kb:.1f} KB)")
     print(f"\n总输出文件数: {sum(len(files) for _, _, files in os.walk(OUTPUT_DIR))}")
