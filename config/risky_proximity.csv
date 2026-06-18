@@ -1,0 +1,11 @@
+﻿term,proximity_risk_level,added_date,notes
+dangerous,high,2026-06-18,与违禁词临近时高度可疑
+hate,high,2026-06-18,仇恨言论邻近标记
+attack,high,2026-06-18,攻击性邻近
+violent,high,2026-06-18,暴力邻近标记
+threat,high,2026-06-18,威胁邻近标记
+evil,medium,2026-06-18,负面定性邻近
+should not be trusted,high,2026-06-18,煽动不信任
+go back,high,2026-06-18,排外言论标记
+inferior,medium,2026-06-18,贬低性邻近
+destroy,medium,2026-06-18,破坏性邻近

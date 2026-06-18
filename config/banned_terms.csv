@@ -1,0 +1,12 @@
+﻿term,category,severity,added_date,notes
+muslim,religious,high,2026-06-18,宗教相关需上下文判断
+islam,religious,high,2026-06-18,宗教相关需上下文判断
+jew,religious,high,2026-06-18,宗教相关需上下文判断
+hindu,religious,medium,2026-06-18,宗教相关需上下文判断
+terrorist,political,high,2026-06-18,政治极端词汇
+bomb,political,high,2026-06-18,暴力相关
+kill,political,high,2026-06-18,暴力相关
+racist,racial,high,2026-06-18,种族歧视
+nazi,political,high,2026-06-18,政治极端
+holocaust,political,high,2026-06-18,政治敏感历史
+genocide,political,high,2026-06-18,政治敏感

@@ -29,3 +29,12 @@ Thumbs.db
 phase3_output/
 phase4_output/
 output_assets/
+
+# SQLite WAL
+db.sqlite3-shm
+db.sqlite3-wal
+*.db-journal
+
+# Temp test scripts
+_test_*.py
+test_security_scanner.py

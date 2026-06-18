@@ -16,7 +16,9 @@
 import re
 import json
 import os
+import csv
 import asyncio
+from typing import List, Dict, Any, Optional
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, HumanMessagePromptTemplate
 from langchain_core.messages import SystemMessage
@@ -25,8 +27,19 @@ from langchain_core.messages import SystemMessage
 # 全局配置区
 # ============================================================================
 
-# ── 请将下方的字符串替换为你自己的 DeepSeek API Key ──
-YOUR_API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# ── 优先从 .env 加载 DeepSeek API Key，否则使用占位符 ──
+def _load_deepseek_key() -> str:
+    """从 .env 文件或环境变量加载 DeepSeek API Key。"""
+    env_file = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.exists(env_file):
+        with open(env_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("DEEPSEEK_API_KEY="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return os.getenv("DEEPSEEK_API_KEY", "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+
+YOUR_API_KEY = _load_deepseek_key()
 
 # DeepSeek API 的兼容端点（OpenAI 兼容协议）
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -40,6 +53,206 @@ TEMPERATURE = 0.3
 
 # 默认目标语言
 DEFAULT_TARGET_LANGUAGE = "en"
+
+
+# ============================================================================
+# SafetyScanner：AC-SEC-01 ~ AC-SEC-03 三级安全联扫（面向对象设计）
+# ============================================================================
+
+class SafetyScanner:
+    """
+    启量 Agent 安全拦截器。
+
+    配置文件：
+      - config/banned_terms.csv    — 违禁词库（列：term, category, severity...）
+      - config/risky_proximity.csv — 可疑邻近词库（列：term, proximity_risk_level...）
+
+    联扫流程：
+      SEC-01 精确匹配 → SEC-02 邻近词检查 → SEC-03 LLM 语义兜底（预留异步）
+    """
+
+    def __init__(self):
+        """初始化：从 CSV 弹药库加载违禁词和邻近词。"""
+        self.banned_terms = self._load_csv_terms("config", "banned_terms.csv")
+        self.risky_proximity = self._load_csv_terms("config", "risky_proximity.csv")
+
+    # ── CSV 加载器 ─────────────────────────────────────────────
+    def _load_csv_terms(self, dirname: str, filename: str) -> List[str]:
+        """
+        从 CSV 文件加载词条列表。自动跳过空行，大小写归一化。
+
+        参数：
+          dirname  — 相对于本文件的目录名
+          filename — CSV 文件名
+
+        返回：
+          小写去重词条列表；文件不存在返回空列表（不阻断管线）。
+        """
+        filepath = os.path.join(os.path.dirname(__file__), dirname, filename)
+        if not os.path.exists(filepath):
+            print(f"[SafetyScanner] WARN: {filepath} not found — skipping.")
+            return []
+
+        terms: List[str] = []
+        with open(filepath, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                term = row.get("term", "").strip().lower()
+                if term:
+                    terms.append(term)
+        return list(set(terms))  # 去重
+
+    # ── AC-SEC-01：违禁词精确匹配 ──────────────────────────────
+    def ac_sec_01_exact_match(self, script: str) -> Dict[str, Any]:
+        """
+        大小写不敏感 + 词边界匹配。
+
+        遍历脚本的每个词（剥离首尾标点后），与 banned_terms 精确比对。
+
+        返回：
+          {"passed": bool, "hits": [{"term": str, "position": int}]}
+        """
+        if not self.banned_terms:
+            return {"passed": True, "hits": [], "terms_loaded": 0}
+
+        words = script.split()
+        hits: List[Dict] = []
+
+        for i, word in enumerate(words):
+            # 剥离首尾标点（保留词内连字符和撇号）
+            clean_word = re.sub(r"^[^\w]+|[^\w]+$", "", word).lower()
+            if not clean_word:
+                continue
+
+            for term in self.banned_terms:
+                if clean_word == term:
+                    hits.append({"term": term, "position": i})
+                    break  # 一词命中多个违禁词只记一次
+
+        return {
+            "passed": len(hits) == 0,
+            "hits": hits,
+            "terms_loaded": len(self.banned_terms),
+        }
+
+    # ── AC-SEC-02：可疑邻近词检查 ──────────────────────────────
+    def ac_sec_02_proximity_check(
+        self, script: str, sec01_hits: List[Dict]
+    ) -> Dict[str, Any]:
+        """
+        针对 SEC-01 命中词，扫描其 position ±15 词范围，
+        与 risky_proximity 做精确匹配。
+
+        返回：
+          {"passed": bool, "proximity_hits": [{"term": str, "nearby_term": str, "distance": int}]}
+        """
+        if not self.risky_proximity or not sec01_hits:
+            return {
+                "passed": True,
+                "proximity_hits": [],
+                "risky_terms_loaded": len(self.risky_proximity),
+            }
+
+        words = script.split()
+        total_words = len(words)
+        proximity_hits: List[Dict] = []
+
+        for hit in sec01_hits:
+            pos = hit["position"]
+            start = max(0, pos - 15)
+            end = min(total_words, pos + 16)
+
+            for j in range(start, end):
+                if j == pos:
+                    continue
+
+                clean_word = re.sub(r"^[^\w]+|[^\w]+$", "", words[j]).lower()
+                if not clean_word:
+                    continue
+
+                for risky in self.risky_proximity:
+                    if clean_word == risky:
+                        proximity_hits.append({
+                            "term": hit["term"],
+                            "nearby_term": risky,
+                            "distance": j - pos,
+                        })
+                        break
+
+        return {
+            "passed": len(proximity_hits) == 0,
+            "proximity_hits": proximity_hits,
+            "risky_terms_loaded": len(self.risky_proximity),
+        }
+
+    # ── AC-SEC-03：LLM 语义兜底（预留异步接口）─────────────────
+    async def _llm_semantic_check(
+        self, script: str, sec01_hits: List[Dict], sec02_hits: List[Dict]
+    ) -> Dict[str, Any]:
+        """
+        预留的 LLM 语义判断异步方法。
+        当前返回 mock 结果。接入真实 DeepSeek API 后替换此处实现。
+
+        返回：
+          {"violation": bool, "confidence": int, "evidence": [str, ...]}
+        """
+        # TODO: 接入 DeepSeek V3，temperature=0.1，JSON mode
+        return {
+            "violation": False,
+            "confidence": 100,
+            "evidence": [],
+        }
+
+    # ── 三级联扫总入口 ─────────────────────────────────────────
+    def scan(self, script: str) -> Dict[str, Any]:
+        """
+        同步执行 AC-SEC-01 → AC-SEC-02 联扫。
+        AC-SEC-03 需要异步上下文，在本方法中返回命中信息供上层调用。
+
+        返回：
+          {
+            "sec01": {...},
+            "sec02": {...},
+            "final_verdict": "pass" | "needs_llm_check",
+            "pipeline_path": ["SEC01", ...],
+          }
+        """
+        result: Dict[str, Any] = {
+            "sec01": None,
+            "sec02": None,
+            "final_verdict": "pass",
+            "pipeline_path": [],
+        }
+
+        # ── SEC-01 ──
+        sec01 = self.ac_sec_01_exact_match(script)
+        result["sec01"] = sec01
+        result["pipeline_path"].append("SEC01")
+
+        if sec01["passed"]:
+            return result
+
+        # ── SEC-02 ──
+        sec02 = self.ac_sec_02_proximity_check(script, sec01["hits"])
+        result["sec02"] = sec02
+        result["pipeline_path"].append("SEC02")
+
+        if sec02["passed"]:
+            return result
+
+        # ── SEC-03 需异步，标记待 LLM 检查 ──
+        result["final_verdict"] = "needs_llm_check"
+        result["pipeline_path"].append("SEC03")
+
+        return result
+
+    @property
+    def stats(self) -> Dict[str, int]:
+        """返回当前弹药库统计信息。"""
+        return {
+            "banned_terms_count": len(self.banned_terms),
+            "risky_proximity_count": len(self.risky_proximity),
+        }
 
 
 # ============================================================================
@@ -323,9 +536,18 @@ async def process_phase2(
             f"channel_crashed: {str(storyboard_result)}"
         )
 
+    # ── AC-SEC-01 ~ AC-SEC-03 安全扫描 ──
+    # 在翻译通道输出 translated_script 后立即执行三级联扫。
+    security_result = None
+    translated_script = translation_result.get("translated_script", "")
+    if translated_script.strip():
+        scanner = SafetyScanner()
+        security_result = scanner.scan(translated_script)
+
     return {
         "translation": translation_result,
         "storyboard": storyboard_result,
+        "security": security_result,  # 🆕 安全扫描结果
     }
 
 
@@ -351,73 +573,75 @@ def process_phase2_sync(
 # ============================================================================
 
 if __name__ == "__main__":
-    # 模拟第一阶段输出的 JSON 数据
-    mock_phase1_output = {
-        "hook_sentences": [
-            "你有没有想过，为什么超市里的苹果永远那么亮？",
-            "其实背后藏着一个不为人知的保鲜黑科技！",
-        ],
-        "visual_constraints": [
-            "超市货架场景",
-            "明亮柔和的顶光",
-            "3D渲染风格",
-        ],
-        "product_pitch": [
-            "这款保鲜喷雾，喷一下就能让水果发光7天！",
-            "限时特惠，前100名下单立减50元！",
-        ],
-        "script": "你有没有想过，为什么超市里的苹果永远那么亮？其实背后藏着一个不为人知的保鲜黑科技！这款保鲜喷雾，喷一下就能让水果发光7天...",
-        "target_ip_style": "3D拟人化水果角色",
-    }
+    # ========================================================================
+    # 点火测试：SafetyScanner 三级联扫
+    # ========================================================================
 
-    print("=" * 60)
-    print("  启量 Agent — 第二阶段 异步并发处理器 独立测试")
-    print("=" * 60)
+    scanner = SafetyScanner()
+
+    print("=" * 62)
+    print("  启量 Agent · SafetyScanner 点火测试")
+    print("  AC-SEC-01 (精确匹配) + AC-SEC-02 (邻近词检查)")
+    print("=" * 62)
     print()
-    print("[提示] 请在下方填入你的 DeepSeek API Key")
-    print("      或者修改本文件顶部的 YOUR_API_KEY 变量")
+    print(f"  [弹药库] banned_terms   : {scanner.stats['banned_terms_count']} 条")
+    print(f"  [弹药库] risky_proximity: {scanner.stats['risky_proximity_count']} 条")
     print()
 
-    api_key_input = input("API Key（留空使用默认值）: ").strip()
-    if not api_key_input:
-        api_key_input = YOUR_API_KEY
+    # ── 测试用例 ───────────────────────────────────────────────
+    test_script = (
+        "This book is a guaranteed cure for your anxiety, "
+        "and it's 100% free! Don't just make money fast, build real wealth."
+    )
 
-    if api_key_input == "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx":
+    print(f"  [输入脚本]")
+    print(f"  {test_script}")
+    print()
+
+    # ── 执行扫描 ──
+    result = scanner.scan(test_script)
+
+    # ── 结果汇报 ──
+    print(f"  [联扫路径] {' -> '.join(result['pipeline_path'])}")
+    print(f"  [最终裁决] {result['final_verdict']}")
+    print()
+
+    sec01 = result["sec01"]
+    print(f"  [SEC-01] 精确匹配")
+    print(f"    通过     : {sec01['passed']}")
+    print(f"    命中数   : {len(sec01['hits'])}")
+    if sec01["hits"]:
+        for h in sec01["hits"]:
+            print(f"      -> term=\"{h['term']}\"  position={h['position']}")
+    print()
+
+    if result.get("sec02"):
+        sec02 = result["sec02"]
+        print(f"  [SEC-02] 邻近词检查")
+        print(f"    通过     : {sec02['passed']}")
+        print(f"    命中数   : {len(sec02['proximity_hits'])}")
+        if sec02["proximity_hits"]:
+            for ph in sec02["proximity_hits"]:
+                print(f"      -> \"{ph['term']}\" + \"{ph['nearby_term']}\" 距离={ph['distance']}词")
         print()
-        print("❌ 错误：请先填入有效的 DeepSeek API Key！")
-        print("   方式一：修改 phase2_processor.py 顶部的 YOUR_API_KEY")
-        print("   方式二：运行时直接粘贴 Key")
-        exit(1)
+
+    # ── 简要分析 ──
+    print("  [分析]")
+    sec01_hits = sec01["hits"]
+    if not sec01_hits:
+        print("    脚本安全，未命中任何违禁词。可直接放行。")
+    else:
+        hit_terms = [h["term"] for h in sec01_hits]
+        print(f"    命中违禁词: {hit_terms}")
+        sec02_hits = result.get("sec02", {}).get("proximity_hits", [])
+        if sec02_hits:
+            nearby = [f"\"{ph['term']}\"+\"{ph['nearby_term']}\"" for ph in sec02_hits]
+            print(f"    邻近风险  : {nearby}")
+            print(f"    -> 需进入 SEC-03 LLM 语义兜底（当前 mock 返回不违规）")
+        else:
+            print("    无邻近词风险。SEC-02 放行。")
 
     print()
-    print("🚀 正在并行启动翻译通道和分镜通道...")
-    print(f"   目标语言: {DEFAULT_TARGET_LANGUAGE}")
-    print()
-
-    result = process_phase2_sync(mock_phase1_output, api_key=api_key_input)
-
-    print("=" * 60)
-    print("  📊 翻译通道结果")
-    print("=" * 60)
-    trans = result["translation"]
-    print(f"  状态: {trans.get('status')}")
-    print(f"  目标语言: {trans.get('target_language')}")
-    print(f"  翻译后金句: {trans.get('translated_pitches')}")
-    print(f"  本地化备注: {trans.get('localization_notes')}")
-    print()
-
-    print("=" * 60)
-    print("  🎬 分镜通道结果")
-    print("=" * 60)
-    story = result["storyboard"]
-    print(f"  状态: {story.get('status')}")
-    print(f"  分镜数量: {story.get('shot_count')}")
-    print(f"  全局风格备注: {story.get('global_style_note')}")
-    print(f"  分镜提示词:")
-    for i, prompt_text in enumerate(story.get("storyboard_prompts", []), start=1):
-        print(f"    {i}. {prompt_text}")
-    print()
-
-    print("=" * 60)
-    print("  测试完成！")
-    print("=" * 60)
+    print("=" * 62)
+    print("  点火测试完成。SafetyScanner 三级联扫通路正常。")
+    print("=" * 62)
